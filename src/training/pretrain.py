@@ -8,7 +8,7 @@ from torch_geometric.data import HeteroData
 from tqdm import tqdm
 
 from src.models.compgcn import CompGCN
-from src.data.graph_builder import build_dense_annotation_matrix
+from src.data.graph_builder import build_annotation_matrix
 from src.utils.losses import ranking_loss, cosine_loss, manifold_alignment_loss
 from src.utils.schedulers import WarmupCosineScheduler
 from src.utils.logger import TrainingLogger
@@ -49,10 +49,9 @@ def pretrain(
     )
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=warmup, total_epochs=epochs)
 
-    # Precompute annotation matrix to sample positives/negatives
-    print("Building annotation matrix ...")
-    ann = build_dense_annotation_matrix(train_data, target_type)   # [N_p, N_go] on same device as data
-    protein_indices, go_indices = ann.nonzero(as_tuple=True)
+    # Load positive (protein, GO) pairs as sparse indices — avoids 26 GB dense matrix
+    print("Building annotation index ...")
+    protein_indices, go_indices, _, _ = build_annotation_matrix(train_data, target_type)
     protein_indices = protein_indices.to(device)
     go_indices = go_indices.to(device)
     num_go = train_data[target_type].x.shape[0]

@@ -192,8 +192,12 @@ def _quick_fmax(
     target_type: str,
     cfg: dict,
     device: str,
+    n_sample: int = 5000,
 ) -> float:
-    """Compute a fast approximate Fmax on the validation split (threshold=0.5)."""
+    """
+    Fast approximate Fmax on a random sample of val proteins.
+    Avoids materialising a [N_p x N_go] dense matrix (would be ~26 GB).
+    """
     from src.data.graph_builder import build_annotation_matrix
     encoder.eval(); generator.eval()
 
@@ -201,21 +205,36 @@ def _quick_fmax(
         protein_embs, go_embs, rel_embs = encoder(val_data)
     rel_vec = rel_embs[rel_idx]
 
-    # Score matrix via DistMult, chunked
-    scores = distmult.score_all_chunked(protein_embs, rel_vec, go_embs, chunk_size=500)
-    scores_sigmoid = torch.sigmoid(scores)   # [N_p, N_go] on CPU
-
     row, col, n_p, n_go = build_annotation_matrix(val_data, target_type)
-    true_mat = torch.zeros(n_p, n_go, dtype=torch.float32)
-    true_mat[row.cpu(), col.cpu()] = 1.0
+    row_cpu, col_cpu = row.cpu(), col.cpu()
 
-    # Single-threshold F1 at 0.5 as a fast proxy
-    pred = (scores_sigmoid >= 0.5).float()
+    # Sample up to n_sample proteins that actually have annotations
+    unique_prots = row_cpu.unique()
+    if len(unique_prots) > n_sample:
+        perm = torch.randperm(len(unique_prots))[:n_sample]
+        unique_prots = unique_prots[perm]
+
+    # Remap to contiguous indices
+    prot_map = {p.item(): i for i, p in enumerate(unique_prots)}
+    mask = torch.isin(row_cpu, unique_prots)
+    s_row = torch.tensor([prot_map[p.item()] for p in row_cpu[mask]], dtype=torch.long)
+    s_col = col_cpu[mask]
+
+    n_sample_actual = len(unique_prots)
+    true_mat = torch.zeros(n_sample_actual, n_go, dtype=torch.float32)
+    true_mat[s_row, s_col] = 1.0
+
+    # Score only the sampled proteins — [n_sample, N_go], safe on T4
+    sampled_embs = protein_embs[unique_prots.to(device)]
+    scores = torch.sigmoid(distmult.score_all(sampled_embs, rel_vec, go_embs)).cpu()
+
+    # Single-threshold F1 at 0.5 as a fast proxy (good enough for early-stop signal)
+    pred = (scores >= 0.5).float()
     tp = (pred * true_mat).sum(dim=1)
     pred_pos = pred.sum(dim=1).clamp(min=1e-8)
     true_pos = true_mat.sum(dim=1).clamp(min=1e-8)
     prec = (tp / pred_pos).mean()
-    rec = (tp / true_pos).mean()
+    rec  = (tp / true_pos).mean()
     fmax = (2 * prec * rec / (prec + rec + 1e-8)).item()
 
     encoder.train(); generator.train()
