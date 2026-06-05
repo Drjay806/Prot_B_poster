@@ -1,0 +1,79 @@
+data:
+  drive_root: "/content/drive/MyDrive/Poster code/prothgt/knowledge_graphs/"
+  ontology: "bp"
+  target_type: "GO_term_P"
+  checkpoint_dir: "/content/drive/MyDrive/Poster code/checkpoints/"
+
+encoder:
+  input_dim_protein: 1280
+  input_dim_go: 200
+  hidden_dim: 512
+  output_dim: 256
+  num_layers: 3
+  composition: "ccorr"
+  dropout_pretrain: 0.3
+  dropout_adv: 0.1
+  use_residual: true
+
+generator:
+  protein_dim: 256
+  relation_dim: 256
+  noise_dim: 64
+  hidden_dims: [512, 512, 256]
+  output_dim: 256
+  negative_slope: 0.2
+
+discriminator:
+  input_dim: 512
+  hidden_dims: [512, 256]
+  output_dim: 1
+  label_smooth_real: 0.9
+  label_smooth_fake: 0.1
+  negative_slope: 0.2
+
+distmult:
+  hidden_dim: 256
+
+reward:
+  lambda_hier: 0.5
+  curriculum_warmup_epochs: 30
+  k_ancestors: 20
+
+pretrain:
+  epochs: 50
+  batch_size: 512
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_negatives: 5
+  ranking_margin: 0.5
+  eval_every: 10
+  warmup_epochs: 10
+  log_every_steps: 50
+
+adversarial:
+  epochs: 100
+  batch_size: 256
+  lr_encoder: 1.0e-4
+  lr_generator: 2.0e-4
+  lr_discriminator: 1.0e-4
+  discriminator_steps: 2
+  grad_clip: 1.0
+  eval_every: 5
+  log_every_steps: 25
+
+rl:
+  epochs: 50
+  batch_size: 128
+  lr_generator: 5.0e-5
+  lr_encoder: 1.0e-5
+  num_samples: 5
+  grad_clip: 1.0
+  eval_every: 3
+  log_every_steps: 10
+
+evaluation:
+  threshold_min: 0.0
+  threshold_max: 1.0
+  threshold_steps: 100
+  propagate_hierarchy: true
+  score_chunk_size: 1000

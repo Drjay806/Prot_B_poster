@@ -1,0 +1,14 @@
+torch==2.1.0
+torch_geometric==2.4.0
+torch_scatter==2.1.2
+torch_sparse==0.6.18
+networkx==3.3
+scikit-learn==1.4.2
+pyyaml==6.0.1
+tqdm==4.66.4
+obonet==1.1.0
+matplotlib==3.9.0
+tensorboard==2.14.0
+numpy==1.26.4
+scipy==1.13.0
+pandas==2.2.2
