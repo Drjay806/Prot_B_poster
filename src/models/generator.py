@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -34,9 +35,6 @@ class Generator(nn.Module):
             if i < len(dims) - 2:
                 layers.append(nn.LayerNorm(dims[i + 1]))
                 layers.append(nn.LeakyReLU(neg_slope))
-        # Final LayerNorm keeps output on same scale as real GO embeddings
-        # and prevents DistMult score explosion during adversarial training.
-        layers.append(nn.LayerNorm(output_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(
@@ -56,7 +54,9 @@ class Generator(nn.Module):
             noise = torch.zeros(B, self.noise_dim, device=device)
 
         x = torch.cat([protein_emb, relation_emb, noise], dim=-1)
-        return self.net(x)
+        # L2-normalize output — parameter-free, cannot be undone by optimizer.
+        # Prevents DistMult score explosion when generator embeddings drift in magnitude.
+        return F.normalize(self.net(x), dim=-1)
 
     def sample(
         self,

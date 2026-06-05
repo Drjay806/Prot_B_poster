@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: F401 used in forward
 from torch import Tensor
 
 
@@ -38,7 +38,8 @@ class Discriminator(nn.Module):
 
     def forward(self, protein_emb: Tensor, go_emb: Tensor) -> Tensor:
         """Returns [B, 1] raw logits (before sigmoid)."""
-        x = torch.cat([protein_emb, go_emb], dim=-1)
+        # Normalize both inputs so discrimination is based on direction, not magnitude.
+        x = torch.cat([F.normalize(protein_emb, dim=-1), F.normalize(go_emb, dim=-1)], dim=-1)
         return self.net(x)
 
     def loss_real(self, protein_emb: Tensor, go_emb: Tensor) -> Tensor:
