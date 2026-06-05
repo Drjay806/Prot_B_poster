@@ -78,21 +78,22 @@ def train_adversarial(
             b_prot_idx = row_s[start:end]
             b_go_idx = col_s[start:end]
 
+            # Encoder runs ONCE per mini-batch in float32 (no autocast — avoids
+            # dtype mismatches from LayerNorm/FFT in mixed-precision mode).
+            protein_embs, go_embs, rel_embs = encoder(train_data)
+            rel_vec = rel_embs[rel_idx]
+            pos_p = protein_embs[b_prot_idx]   # keeps grad graph for G+E update
+            pos_g = go_embs[b_go_idx]
+
             # ── Discriminator updates (d_steps times) ──────────────────────────────
+            # Use detached encoder outputs so discriminator loss doesn't touch encoder.
             for _ in range(d_steps):
                 opt_dis.zero_grad()
                 with torch.amp.autocast('cuda'):
-                    protein_embs, go_embs, rel_embs = encoder(train_data)
-                    rel_vec = rel_embs[rel_idx]
-
-                    pos_p = protein_embs[b_prot_idx]
-                    pos_g = go_embs[b_go_idx]
-
                     noise = torch.randn(len(b_prot_idx), generator.noise_dim, device=device)
                     fake_g = generator(pos_p.detach(), rel_vec.detach(), noise)
-
                     loss_real = discriminator.loss_real(pos_p.detach(), pos_g.detach())
-                    loss_fake = discriminator.loss_fake(pos_p.detach(), fake_g)
+                    loss_fake = discriminator.loss_fake(pos_p.detach(), fake_g.detach())
                     loss_d = loss_real + loss_fake
 
                 scaler.scale(loss_d).backward()
@@ -101,13 +102,10 @@ def train_adversarial(
                 scaler.update()
 
             # ── Generator + Encoder update (1 time) ────────────────────────────────
+            # pos_p still holds the full encoder computation graph here.
             opt_gen.zero_grad()
             opt_enc.zero_grad()
             with torch.amp.autocast('cuda'):
-                protein_embs, go_embs, rel_embs = encoder(train_data)
-                rel_vec = rel_embs[rel_idx]
-
-                pos_p = protein_embs[b_prot_idx]
                 noise = torch.randn(len(b_prot_idx), generator.noise_dim, device=device)
                 fake_g = generator(pos_p, rel_vec, noise)
 
@@ -201,8 +199,8 @@ def _quick_fmax(
     from src.data.graph_builder import build_annotation_matrix
     encoder.eval(); generator.eval()
 
-    with torch.amp.autocast('cuda'):
-        protein_embs, go_embs, rel_embs = encoder(val_data)
+    # Encoder in float32 (no autocast) — same reason as training path
+    protein_embs, go_embs, rel_embs = encoder(val_data)
     rel_vec = rel_embs[rel_idx]
 
     row, col, n_p, n_go = build_annotation_matrix(val_data, target_type)

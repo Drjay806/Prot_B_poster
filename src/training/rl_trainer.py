@@ -81,8 +81,8 @@ def train_rl(
             opt_gen.zero_grad()
             opt_enc.zero_grad()
 
-            with torch.amp.autocast('cuda'):
-                protein_embs, go_embs, rel_embs = encoder(train_data)
+            # Encoder in float32 (no autocast) — avoids LayerNorm/FFT dtype mismatches
+            protein_embs, go_embs, rel_embs = encoder(train_data)
             rel_vec = rel_embs[rel_idx]
 
             pos_p = protein_embs[b_prot_idx]   # [B, D]
