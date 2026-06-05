@@ -62,8 +62,8 @@ adversarial:
   batch_size: 256
   lr_encoder: 1.0e-4
   lr_generator: 2.0e-4
-  lr_discriminator: 1.0e-4
-  discriminator_steps: 2
+  lr_discriminator: 5.0e-5
+  discriminator_steps: 1
   grad_clip: 1.0
   eval_every: 5
   log_every_steps: 25
