@@ -7,9 +7,9 @@ data:
 encoder:
   input_dim_protein: 1280
   input_dim_go: 200
-  hidden_dim: 512
+  hidden_dim: 256
   output_dim: 256
-  num_layers: 3
+  num_layers: 2
   composition: "ccorr"
   dropout_pretrain: 0.3
   dropout_adv: 0.1

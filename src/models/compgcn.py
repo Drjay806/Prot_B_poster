@@ -59,6 +59,8 @@ class CompGCNLayer(nn.Module):
                 continue
 
             e_rel = rel_embs[rel_idx]  # [D] — one vector for the whole relation type
+            # Precompute rfft of the relation vector ONCE (same for every chunk in this type)
+            fb_single = torch.fft.rfft(e_rel.unsqueeze(0), dim=-1)               # [1, D/2+1]
 
             for chunk_s in range(0, n_edges, _EDGE_CHUNK):
                 chunk_e = min(chunk_s + _EDGE_CHUNK, n_edges)
@@ -66,10 +68,14 @@ class CompGCNLayer(nn.Module):
                 dst_idx = edge_index[1, chunk_s:chunk_e]
 
                 e_src = node_embs[src_type][src_idx]                              # [chunk, D]
-                e_rel_exp = e_rel.unsqueeze(0).expand(len(src_idx), -1)           # [chunk, D]
-
-                msg_out = self.W_O(ccorr(e_src, e_rel_exp))                       # [chunk, out_dim]
-                msg_in  = self.W_I(ccorr(e_src, e_rel_exp))                       # [chunk, out_dim]
+                # Compute ccorr ONCE and share between W_O and W_I.
+                # Old code called ccorr twice, storing 3 extra tensors per chunk in the
+                # backward graph. Shared composition halves activation storage.
+                fa = torch.fft.rfft(e_src, dim=-1)                               # [chunk, D/2+1]
+                composed = torch.fft.irfft(fa.conj() * fb_single,
+                                           n=self.in_dim, dim=-1)                 # [chunk, D]
+                msg_out = self.W_O(composed)                                      # [chunk, out_dim]
+                msg_in  = self.W_I(composed)                                      # [chunk, out_dim]
 
                 # agg buffers derive dtype from msg so scatter_add_ never has a type mismatch
                 if dst_type not in agg:
