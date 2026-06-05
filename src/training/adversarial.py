@@ -73,27 +73,32 @@ def train_adversarial(
                              "disc/real_acc", "disc/fake_acc", "embed/gen_output_norm"]
         }
 
+        # Encoder called ONCE per epoch — same strategy as pretrain.
+        # Encoder is frozen during adversarial phase; fine-tuned in RL instead.
+        encoder.eval()
+        with torch.no_grad():
+            protein_embs, go_embs, rel_embs = encoder(train_data)
+        encoder.train()
+        protein_embs = protein_embs.detach()
+        go_embs      = go_embs.detach()
+        rel_vec      = rel_embs[rel_idx].detach()
+
         for start in range(0, len(row_s), batch_size):
             end = min(start + batch_size, len(row_s))
             b_prot_idx = row_s[start:end]
-            b_go_idx = col_s[start:end]
+            b_go_idx   = col_s[start:end]
 
-            # Encoder runs ONCE per mini-batch in float32 (no autocast — avoids
-            # dtype mismatches from LayerNorm/FFT in mixed-precision mode).
-            protein_embs, go_embs, rel_embs = encoder(train_data)
-            rel_vec = rel_embs[rel_idx]
-            pos_p = protein_embs[b_prot_idx]   # keeps grad graph for G+E update
+            pos_p = protein_embs[b_prot_idx]
             pos_g = go_embs[b_go_idx]
 
             # ── Discriminator updates (d_steps times) ──────────────────────────────
-            # Use detached encoder outputs so discriminator loss doesn't touch encoder.
             for _ in range(d_steps):
                 opt_dis.zero_grad()
                 with torch.amp.autocast('cuda'):
                     noise = torch.randn(len(b_prot_idx), generator.noise_dim, device=device)
-                    fake_g = generator(pos_p.detach(), rel_vec.detach(), noise)
-                    loss_real = discriminator.loss_real(pos_p.detach(), pos_g.detach())
-                    loss_fake = discriminator.loss_fake(pos_p.detach(), fake_g.detach())
+                    fake_g = generator(pos_p, rel_vec, noise)
+                    loss_real = discriminator.loss_real(pos_p, pos_g)
+                    loss_fake = discriminator.loss_fake(pos_p, fake_g.detach())
                     loss_d = loss_real + loss_fake
 
                 scaler.scale(loss_d).backward()
@@ -101,26 +106,22 @@ def train_adversarial(
                 scaler.step(opt_dis)
                 scaler.update()
 
-            # ── Generator + Encoder update (1 time) ────────────────────────────────
-            # pos_p still holds the full encoder computation graph here.
+            # ── Generator update (1 time) ───────────────────────────────────────────
             opt_gen.zero_grad()
-            opt_enc.zero_grad()
             with torch.amp.autocast('cuda'):
                 noise = torch.randn(len(b_prot_idx), generator.noise_dim, device=device)
                 fake_g = generator(pos_p, rel_vec, noise)
 
                 loss_adv = discriminator.adversarial_loss_for_generator(pos_p, fake_g)
 
-                # DistMult structural loss: push generated GO to score high with protein
                 dm_scores = distmult(pos_p, rel_vec.unsqueeze(0).expand_as(pos_p), fake_g)
-                loss_struct = -dm_scores.mean()   # maximise score ↔ minimise negative
+                loss_struct = -dm_scores.mean()
 
                 loss_g = loss_adv + 0.5 * loss_struct
 
             scaler.scale(loss_g).backward()
-            torch.nn.utils.clip_grad_norm_(list(generator.parameters()) + list(encoder.parameters()), grad_clip)
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
             scaler.step(opt_gen)
-            scaler.step(opt_enc)
             scaler.update()
 
             global_step += 1
