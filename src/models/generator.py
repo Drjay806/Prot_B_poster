@@ -31,9 +31,12 @@ class Generator(nn.Module):
         layers = []
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:   # all but final
+            if i < len(dims) - 2:
                 layers.append(nn.LayerNorm(dims[i + 1]))
                 layers.append(nn.LeakyReLU(neg_slope))
+        # Final LayerNorm keeps output on same scale as real GO embeddings
+        # and prevents DistMult score explosion during adversarial training.
+        layers.append(nn.LayerNorm(output_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(
