@@ -58,7 +58,7 @@ def pretrain(
 
     print(f"Starting pre-training: {epochs} epochs, {len(protein_indices):,} positive pairs")
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     global_step = 0
 
     for epoch in range(1, epochs + 1):
@@ -77,7 +77,7 @@ def pretrain(
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 protein_embs, go_embs, _ = encoder(train_data)
 
                 # Positive embeddings
@@ -162,7 +162,7 @@ def pretrain(
 @torch.no_grad()
 def _val_cosine(encoder: CompGCN, val_data: HeteroData, target_type: str, cfg: dict, device: str) -> float:
     encoder.eval()
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast('cuda'):
         protein_embs, go_embs, _ = encoder(val_data)
 
     from src.data.graph_builder import build_annotation_matrix

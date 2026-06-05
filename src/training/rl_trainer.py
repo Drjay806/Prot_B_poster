@@ -81,7 +81,7 @@ def train_rl(
             opt_gen.zero_grad()
             opt_enc.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 protein_embs, go_embs, rel_embs = encoder(train_data)
             rel_vec = rel_embs[rel_idx]
 

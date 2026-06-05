@@ -65,21 +65,22 @@ class CompGCNLayer(nn.Module):
             # Incoming direction: treat as inverse relation
             msg_in = self.W_I(ccorr(e_src, e_rel))    # [E, out_dim]
 
+            # agg buffers must match msg dtype — inside autocast both are float16;
+            # scatter_add_ requires self.dtype == src.dtype, so derive from msg_out.
             n_dst = num_nodes[dst_type]
-            # Scatter-add both directions into destination aggregation buffer
             if dst_type not in agg:
-                agg[dst_type] = torch.zeros(n_dst, self.out_dim, device=e_src.device)
+                agg[dst_type] = torch.zeros(n_dst, self.out_dim, device=e_src.device, dtype=msg_out.dtype)
             agg[dst_type].scatter_add_(0, dst_idx.unsqueeze(1).expand(-1, self.out_dim), msg_out)
 
             n_src = num_nodes[src_type]
             if src_type not in agg:
-                agg[src_type] = torch.zeros(n_src, self.out_dim, device=e_src.device)
+                agg[src_type] = torch.zeros(n_src, self.out_dim, device=e_src.device, dtype=msg_in.dtype)
             agg[src_type].scatter_add_(0, src_idx.unsqueeze(1).expand(-1, self.out_dim), msg_in)
 
         # Combine aggregated messages with self-loop
         new_node_embs: Dict[str, Tensor] = {}
         for ntype, h in node_embs.items():
-            agg_msg = agg.get(ntype, torch.zeros(h.size(0), self.out_dim, device=h.device))
+            agg_msg = agg.get(ntype, torch.zeros(h.size(0), self.out_dim, device=h.device, dtype=h.dtype))
             self_msg = self.W_S(h)
             combined = self.norm(self.dropout(agg_msg) + self_msg)
             new_node_embs[ntype] = F.leaky_relu(combined, negative_slope=0.2)

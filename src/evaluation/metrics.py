@@ -41,7 +41,7 @@ def evaluate_all(
     encoder.eval(); generator.eval()
 
     print("Encoding graph ...")
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast('cuda'):
         protein_embs, go_embs, rel_embs = encoder(data)
     rel_idx = _get_has_function_rel_idx(encoder)
     rel_vec  = rel_embs[rel_idx].detach()
@@ -70,7 +70,7 @@ def evaluate_all(
         chunk_len = prot_end - prot_start
 
         # Score [chunk, N_go] on GPU, move to CPU immediately
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             chunk_scores = torch.sigmoid(
                 distmult.score_all(protein_embs[prot_start:prot_end], rel_vec, go_embs)
             ).cpu()
@@ -127,7 +127,7 @@ def evaluate_all(
     auc_true  = torch.zeros(len(sel), n_go, dtype=torch.float32)
     auc_true[auc_row, auc_col] = 1.0
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast('cuda'):
         auc_scores = torch.sigmoid(
             distmult.score_all(protein_embs[sel.to(device)], rel_vec, go_embs)
         ).cpu()

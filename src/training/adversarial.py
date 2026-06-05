@@ -49,7 +49,7 @@ def train_adversarial(
     opt_gen = torch.optim.Adam(generator.parameters(), lr=adv_cfg["lr_generator"], betas=(0.5, 0.999))
     opt_dis = torch.optim.Adam(discriminator.parameters(), lr=adv_cfg["lr_discriminator"], betas=(0.5, 0.999))
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # Precompute positive edges for sampling
     row, col, n_p, n_go = build_annotation_matrix(train_data, target_type)
@@ -81,7 +81,7 @@ def train_adversarial(
             # ── Discriminator updates (d_steps times) ──────────────────────────────
             for _ in range(d_steps):
                 opt_dis.zero_grad()
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     protein_embs, go_embs, rel_embs = encoder(train_data)
                     rel_vec = rel_embs[rel_idx]
 
@@ -103,7 +103,7 @@ def train_adversarial(
             # ── Generator + Encoder update (1 time) ────────────────────────────────
             opt_gen.zero_grad()
             opt_enc.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 protein_embs, go_embs, rel_embs = encoder(train_data)
                 rel_vec = rel_embs[rel_idx]
 
@@ -201,7 +201,7 @@ def _quick_fmax(
     from src.data.graph_builder import build_annotation_matrix
     encoder.eval(); generator.eval()
 
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast('cuda'):
         protein_embs, go_embs, rel_embs = encoder(val_data)
     rel_vec = rel_embs[rel_idx]
 
