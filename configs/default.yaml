@@ -14,6 +14,13 @@ encoder:
   dropout_pretrain: 0.3
   dropout_adv: 0.1
   use_residual: true
+  # Limit message passing to these relation types to keep VRAM within T4 budget.
+  # "protein_function" carries the direct supervision signal; "function_function"
+  # propagates GO hierarchy information.  Leave empty [] to use all 48 edge types
+  # (risks OOM on large graphs).
+  gnn_edge_types:
+    - "protein_function"
+    - "function_function"
 
 generator:
   protein_dim: 256
