@@ -65,49 +65,48 @@ def pretrain(
     print(f"Starting pre-training: {epochs} epochs, {n_pairs:,} positive pairs "
           f"(sampling {min(n_pairs, _MAX_PAIRS_EPOCH):,}/epoch)")
 
-    scaler = torch.amp.GradScaler('cuda')
     global_step = 0
 
     for epoch in range(1, epochs + 1):
         scheduler.step(epoch - 1)
         optimizer.zero_grad()
 
-        # ── Single full-graph forward pass ──────────────────────────────────────
-        with torch.amp.autocast('cuda'):
-            protein_embs, go_embs, _ = encoder(train_data)
+        # ── Single full-graph forward pass (float32, no autocast) ───────────────
+        # Autocast is intentionally excluded from the encoder: the GCN uses FFT and
+        # LayerNorm whose autocast dtypes interact badly with scatter_add_.
+        protein_embs, go_embs, _ = encoder(train_data)
 
-            # Sample pairs for this epoch
-            sample_sz = min(n_pairs, _MAX_PAIRS_EPOCH)
-            perm      = torch.randperm(n_pairs, device=device)[:sample_sz]
-            b_prot    = protein_indices[perm]
-            b_go      = go_indices[perm]
+        # Sample pairs for this epoch
+        sample_sz = min(n_pairs, _MAX_PAIRS_EPOCH)
+        perm      = torch.randperm(n_pairs, device=device)[:sample_sz]
+        b_prot    = protein_indices[perm]
+        b_go      = go_indices[perm]
 
-            pos_p = protein_embs[b_prot]   # [S, D]
-            pos_g = go_embs[b_go]           # [S, D]
+        pos_p = protein_embs[b_prot]   # [S, D]
+        pos_g = go_embs[b_go]           # [S, D]
 
-            neg_go_idx = torch.randint(0, num_go, (sample_sz * num_neg,), device=device)
-            neg_g = go_embs[neg_go_idx].view(sample_sz, num_neg, -1)   # [S, neg, D]
+        neg_go_idx = torch.randint(0, num_go, (sample_sz * num_neg,), device=device)
+        neg_g = go_embs[neg_go_idx].view(sample_sz, num_neg, -1)   # [S, neg, D]
 
-            l_mse  = F.mse_loss(pos_p, pos_g)
-            l_cos  = cosine_loss(pos_p, pos_g)
-            pos_sc = (pos_p * pos_g).sum(-1, keepdim=True)              # [S, 1]
-            neg_sc = (pos_p.unsqueeze(1) * neg_g).sum(-1)               # [S, neg]
-            l_rank = ranking_loss(
-                pos_sc.expand_as(neg_sc).reshape(-1),
-                neg_sc.reshape(-1),
-                margin=margin,
-            )
-            l_mmd = manifold_alignment_loss(pos_p, pos_g)
+        l_mse  = F.mse_loss(pos_p, pos_g)
+        l_cos  = cosine_loss(pos_p, pos_g)
+        pos_sc = (pos_p * pos_g).sum(-1, keepdim=True)
+        neg_sc = (pos_p.unsqueeze(1) * neg_g).sum(-1)
+        l_rank = ranking_loss(
+            pos_sc.expand_as(neg_sc).reshape(-1),
+            neg_sc.reshape(-1),
+            margin=margin,
+        )
+        l_mmd = manifold_alignment_loss(pos_p, pos_g)
 
-            losses = torch.stack([l_mse, l_cos, l_rank, l_mmd])
-            w = F.softmax(loss_weights, dim=0)
-            total_loss = (w * losses).sum()
+        losses     = torch.stack([l_mse, l_cos, l_rank, l_mmd])
+        w          = F.softmax(loss_weights, dim=0)
+        total_loss = (w * losses).sum()
 
         # ── Single backward + step ──────────────────────────────────────────────
-        scaler.scale(total_loss).backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         global_step += 1
 
@@ -150,7 +149,7 @@ def pretrain(
 def _val_cosine(encoder: CompGCN, val_data: HeteroData, target_type: str,
                 cfg: dict, device: str) -> float:
     encoder.eval()
-    with torch.amp.autocast('cuda'):
+    with torch.no_grad():
         protein_embs, go_embs, _ = encoder(val_data)
 
     from src.data.graph_builder import build_annotation_matrix

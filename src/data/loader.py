@@ -30,7 +30,7 @@ class ProtHGTSplits(NamedTuple):
 def load_prothgt_splits(
     drive_root: str,
     ontology: str = "bp",
-    device: str = "cuda",
+    device: str = "cpu",
 ) -> ProtHGTSplits:
     """
     Load the three ProtHGT ESM2 split .pt files from Google Drive.
