@@ -102,7 +102,7 @@ def train_adversarial(
             "loss/critic", "loss/gen", "loss/anchor",
             "reward/distmult_mean",
             "scores/real", "scores/fake", "scores/hard",
-            "disc/real_acc", "disc/fake_acc",
+            "disc/real_acc", "disc/ranking_acc",
         ]}
 
         # Encoder called ONCE per epoch — frozen during adversarial phase.
@@ -177,7 +177,9 @@ def train_adversarial(
             #    convincing," which forces the critic to learn biological compatibility.
             anchor_loss = (1.0 - F.cosine_similarity(fake_g, pos_g)).mean()
 
-            loss_gen = adv_loss + 0.5 * dm_loss + 0.3 * anchor_loss
+            # Weights: anchor dominates so generator stays near true GO;
+            # adv is reduced so it stops fighting the anchor by maximising critic scores.
+            loss_gen = 0.3 * adv_loss + 0.5 * dm_loss + 1.0 * anchor_loss
 
             loss_gen.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
@@ -187,8 +189,11 @@ def train_adversarial(
 
             # Monitoring (no_grad)
             with torch.no_grad():
-                ra = discriminator.accuracy(pos_p, pos_g,   is_real=True)
-                fa = discriminator.accuracy(pos_p, fake_g,  is_real=False)
+                ra = discriminator.accuracy(pos_p, pos_g,  is_real=True)
+                # ranking_acc: does critic prefer real over fake for same protein?
+                # This is the correct WGAN metric. fake_acc (score<0) is meaningless
+                # in WGAN because scores are unbounded — the threshold 0 is arbitrary.
+                ranking_acc = (score_real.detach() > score_fake.detach()).float().mean().item()
 
             step_metrics = {
                 "loss/critic":          loss_crit.item(),
@@ -199,7 +204,7 @@ def train_adversarial(
                 "scores/fake":          score_fake.detach().mean().item(),
                 "scores/hard":          score_hard.detach().mean().item(),
                 "disc/real_acc":        ra,
-                "disc/fake_acc":        fa,
+                "disc/ranking_acc":     ranking_acc,
             }
             for k, v in step_metrics.items():
                 epoch_metrics[k].append(v)
@@ -230,7 +235,7 @@ def train_adversarial(
                 f"anchor={avg['loss/anchor']:.3f}  "
                 f"scores(real={avg['scores/real']:.2f} fake={avg['scores/fake']:.2f} hard={avg['scores/hard']:.2f})  "
                 f"DistMult={avg['reward/distmult_mean']:.3f}  "
-                f"acc(real={avg['disc/real_acc']*100:.0f}% fake={avg['disc/fake_acc']*100:.0f}%)"
+                f"acc(real={avg['disc/real_acc']*100:.0f}% rank={avg['disc/ranking_acc']*100:.0f}%)"
                 f"{fmax_str}"
             )
 
