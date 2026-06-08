@@ -94,7 +94,7 @@ def train_adversarial(
         row_s_cpu      = row_s.cpu()
 
         epoch_metrics: Dict[str, list] = {k: [] for k in [
-            "loss/critic", "loss/gen",
+            "loss/critic", "loss/gen", "loss/anchor",
             "reward/distmult_mean",
             "scores/real", "scores/fake", "scores/hard",
             "disc/real_acc", "disc/fake_acc",
@@ -158,9 +158,21 @@ def train_adversarial(
             noise  = torch.randn(len(b_prot_idx), generator.noise_dim, device=device)
             fake_g = generator(pos_p, rel_vec, noise)
 
-            # Maximise critic score on generated pairs + DistMult structural reward
+            # 1. Fool the critic (Wasserstein adversarial signal)
+            adv_loss = -discriminator.score(pos_p, fake_g).mean()
+
+            # 2. Structural plausibility via DistMult
             dm_scores = distmult(pos_p, rel_vec.unsqueeze(0).expand_as(pos_p), fake_g)
-            loss_gen  = -discriminator.score(pos_p, fake_g).mean() - 0.5 * dm_scores.mean()
+            dm_loss   = -dm_scores.mean()
+
+            # 3. Cosine anchor: pull generator toward the TRUE GO embedding neighborhood.
+            #    Without this, the generator has zero incentive to produce biologically
+            #    correct embeddings — it just needs to fool the critic anywhere on the
+            #    unit sphere.  This keeps fake "close but wrong" rather than "anywhere
+            #    convincing," which forces the critic to learn biological compatibility.
+            anchor_loss = (1.0 - F.cosine_similarity(fake_g, pos_g)).mean()
+
+            loss_gen = adv_loss + 0.5 * dm_loss + 0.3 * anchor_loss
 
             loss_gen.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
@@ -176,6 +188,7 @@ def train_adversarial(
             step_metrics = {
                 "loss/critic":          loss_crit.item(),
                 "loss/gen":             loss_gen.item(),
+                "loss/anchor":          anchor_loss.item(),
                 "reward/distmult_mean": dm_scores.detach().mean().item(),
                 "scores/real":          score_real.detach().mean().item(),
                 "scores/fake":          score_fake.detach().mean().item(),
@@ -209,6 +222,7 @@ def train_adversarial(
             print(
                 f"[Adv {epoch}/{epochs}] "
                 f"W_dist={w_dist_approx:.3f}  C_loss={avg['loss/critic']:.3f}  G_loss={avg['loss/gen']:.3f}  "
+                f"anchor={avg['loss/anchor']:.3f}  "
                 f"scores(real={avg['scores/real']:.2f} fake={avg['scores/fake']:.2f} hard={avg['scores/hard']:.2f})  "
                 f"DistMult={avg['reward/distmult_mean']:.3f}  "
                 f"acc(real={avg['disc/real_acc']*100:.0f}% fake={avg['disc/fake_acc']*100:.0f}%)"
