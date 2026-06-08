@@ -67,7 +67,7 @@ def train_adversarial(
         discriminator.parameters(),
         lr=adv_cfg.get("lr_critic", adv_cfg["lr_discriminator"]),
         betas=(beta1, beta2),
-        weight_decay=1e-4,   # prevents score drift when spectral norm caps per-layer not globally
+        weight_decay=5e-4,   # prevents score drift when spectral norm caps per-layer not globally
     )
 
     # Precompute positive edges for sampling
@@ -177,9 +177,11 @@ def train_adversarial(
             #    convincing," which forces the critic to learn biological compatibility.
             anchor_loss = (1.0 - F.cosine_similarity(fake_g, pos_g)).mean()
 
-            # Weights: anchor dominates so generator stays near true GO;
-            # adv is reduced so it stops fighting the anchor by maximising critic scores.
-            loss_gen = 0.3 * adv_loss + 0.5 * dm_loss + 1.0 * anchor_loss
+            # Weights: adv dominates so the generator explores GO space and gives
+            # the critic real diversity to learn from. Anchor at 0.2 is a light
+            # semantic tether — prevents unconstrained drift without collapsing
+            # fake → true GO (which kills the critic's training signal).
+            loss_gen = 0.7 * adv_loss + 0.5 * dm_loss + 0.2 * anchor_loss
 
             loss_gen.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
