@@ -14,13 +14,12 @@ encoder:
   dropout_pretrain: 0.3
   dropout_adv: 0.1
   use_residual: true
-  # Limit message passing to these relation types to keep VRAM within T4 budget.
-  # "protein_function" carries the direct supervision signal; "function_function"
-  # propagates GO hierarchy information.  Leave empty [] to use all 48 edge types
-  # (risks OOM on large graphs).
-  gnn_edge_types:
-    - "protein_function"
-    - "function_function"
+  # Use ALL edge types in the knowledge graph.
+  # Gradient checkpointing in CompGCN makes this memory-safe on T4.
+  # Edges are processed in 50k chunks serially — peak memory does not grow with
+  # edge count, only with number of node types (each adds a ~50 MB agg tensor).
+  # If OOM occurs, add specific edge types here to dial back selectively.
+  gnn_edge_types: []
 
 generator:
   protein_dim: 256
