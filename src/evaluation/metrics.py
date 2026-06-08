@@ -59,20 +59,59 @@ def evaluate_all(
         prop_edges = build_propagation_edges(data, target_type)
 
     # ── Streaming Fmax ───────────────────────────────────────────────────────────
-    # Pre-normalise for cosine scoring — encoder was trained with cosine/dot objective;
-    # DistMult relation vector was never trained, so cosine similarity is the correct scorer.
+    # Hybrid scoring: encoder cosine similarity + generator-guided similarity.
+    #
+    # Encoder cosine: direct lookup of protein embedding vs all GO embeddings.
+    # Generator path: protein → generator → predicted GO embedding → cosine vs all GO.
+    #
+    # Why combine both:
+    #   Encoder cosine alone is pure lookup — same as ProtHGT minus the richer graph.
+    #   The generator was trained (Phase 3) to navigate toward the correct region of
+    #   GO space.  Its predicted embedding should sit closer to the true GO terms than
+    #   the raw protein embedding, because it was explicitly pushed there by RL.
+    #   Averaging the two signals is more accurate than either alone.
+    #
+    # gen_weight=0.3 is conservative — encoder is the trusted signal, generator adds
+    # a directional boost.  Set gen_weight=0.0 to fall back to encoder-only.
+    gen_weight = eval_cfg.get("gen_weight", 0.3)
+    enc_weight = 1.0 - gen_weight
+
     p_norm = torch.nn.functional.normalize(protein_embs.float(), dim=-1)   # [N_p, D]
     g_norm = torch.nn.functional.normalize(go_embs.float(), dim=-1)        # [N_go, D]
 
+    # Precompute generator output for all proteins (deterministic: noise=0)
+    if gen_weight > 0:
+        print(f"Computing generator embeddings for {n_p:,} proteins (noise=0, deterministic) ...")
+        gen_chunks = []
+        gen_batch  = 512
+        for gs in range(0, n_p, gen_batch):
+            ge = min(gs + gen_batch, n_p)
+            with torch.no_grad():
+                chunk_p   = protein_embs[gs:ge].to(device)
+                rel_chunk = rel_vec.unsqueeze(0).expand(ge - gs, -1)
+                noise     = torch.zeros(ge - gs, generator.noise_dim, device=device)
+                fake_go   = generator(chunk_p, rel_chunk, noise)
+            gen_chunks.append(torch.nn.functional.normalize(fake_go.float(), dim=-1).cpu())
+        gen_p_norm = torch.cat(gen_chunks, dim=0)   # [N_p, D] — normalised generator output
+        del gen_chunks
+    else:
+        gen_p_norm = None
+
     # Discover actual score range with a small probe so thresholds cover it properly
     with torch.no_grad():
-        probe = (p_norm[:min(500, n_p)] @ g_norm.t()).cpu()
+        enc_probe = (p_norm[:min(500, n_p)] @ g_norm.t()).cpu()
+        if gen_p_norm is not None:
+            gen_probe = (gen_p_norm[:min(500, n_p)].to(device) @ g_norm.t()).cpu()
+            probe = enc_weight * enc_probe + gen_weight * gen_probe
+        else:
+            probe = enc_probe
     score_min = float(probe.min())
     score_max = float(probe.max())
     del probe
 
     print(f"Computing Fmax (streaming over {n_p:,} proteins in chunks of {chunk_size}) ...")
-    print(f"  Score range probe: [{score_min:.3f}, {score_max:.3f}] — thresholds span this range")
+    print(f"  Score range probe: [{score_min:.3f}, {score_max:.3f}]")
+    print(f"  Scoring: {enc_weight:.1f}×encoder_cosine + {gen_weight:.1f}×generator_cosine")
     thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
     sum_prec   = np.zeros(t_steps + 1)
     sum_rec    = np.zeros(t_steps + 1)
@@ -82,9 +121,13 @@ def evaluate_all(
         prot_end  = min(prot_start + chunk_size, n_p)
         chunk_len = prot_end - prot_start
 
-        # Cosine similarity [chunk, N_go] on GPU, move to CPU immediately
         with torch.no_grad():
-            chunk_scores = (p_norm[prot_start:prot_end] @ g_norm.t()).cpu()
+            enc_scores = (p_norm[prot_start:prot_end] @ g_norm.t()).cpu()
+            if gen_p_norm is not None:
+                gen_scores = (gen_p_norm[prot_start:prot_end].to(device) @ g_norm.t()).cpu()
+                chunk_scores = enc_weight * enc_scores + gen_weight * gen_scores
+            else:
+                chunk_scores = enc_scores
 
         # True labels for this chunk (sparse → dense in-chunk only)
         chunk_mask = (row_cpu >= prot_start) & (row_cpu < prot_end)

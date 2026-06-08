@@ -86,8 +86,11 @@ rl:
   log_every_steps: 10
 
 evaluation:
-  threshold_min: 0.0
-  threshold_max: 1.0
   threshold_steps: 100
   propagate_hierarchy: true
   score_chunk_size: 1000
+  # Hybrid scoring weight for generator output.
+  # Final score = (1-gen_weight)*encoder_cosine + gen_weight*generator_cosine
+  # Set to 0.0 to use encoder-only (ablation baseline).
+  # Set to 0.3 for normal use after Phase 3 completes.
+  gen_weight: 0.3
