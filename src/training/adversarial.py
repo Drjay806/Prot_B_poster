@@ -63,7 +63,12 @@ def train_adversarial(
     # WGAN-GP requires Adam(β1=0, β2=0.9) — other betas destabilise Wasserstein
     opt_enc  = torch.optim.Adam(encoder.parameters(),       lr=adv_cfg["lr_encoder"],     betas=(beta1, beta2))
     opt_gen  = torch.optim.Adam(generator.parameters(),     lr=adv_cfg["lr_generator"],   betas=(beta1, beta2))
-    opt_crit = torch.optim.Adam(discriminator.parameters(), lr=adv_cfg.get("lr_critic", adv_cfg["lr_discriminator"]), betas=(beta1, beta2))
+    opt_crit = torch.optim.Adam(
+        discriminator.parameters(),
+        lr=adv_cfg.get("lr_critic", adv_cfg["lr_discriminator"]),
+        betas=(beta1, beta2),
+        weight_decay=1e-4,   # prevents score drift when spectral norm caps per-layer not globally
+    )
 
     # Precompute positive edges for sampling
     row, col, n_p, n_go = build_annotation_matrix(train_data, target_type)
@@ -314,13 +319,20 @@ def _quick_fmax(
     sampled_embs = protein_embs[unique_prots.to(device)]
     scores = torch.sigmoid(distmult.score_all(sampled_embs, rel_vec, go_embs)).cpu()
 
-    pred    = (scores >= 0.5).float()
-    tp      = (pred * true_mat).sum(dim=1)
-    pred_pos = pred.sum(dim=1).clamp(min=1e-8)
-    true_pos = true_mat.sum(dim=1).clamp(min=1e-8)
-    prec    = (tp / pred_pos).mean()
-    rec     = (tp / true_pos).mean()
-    fmax    = (2 * prec * rec / (prec + rec + 1e-8)).item()
+    # Proper Fmax: sweep thresholds, report the max F1.
+    # A fixed threshold of 0.5 fails when scores are compressed near 0 —
+    # thousands of wrong GO terms also cross 0.5, precision collapses to ~0.
+    best_fmax    = 0.0
+    true_pos_cnt = true_mat.sum(dim=1).clamp(min=1e-8)
+    for thresh in [t / 100 for t in range(0, 100, 2)]:
+        pred     = (scores >= thresh).float()
+        tp       = (pred * true_mat).sum(dim=1)
+        pred_pos = pred.sum(dim=1).clamp(min=1e-8)
+        prec     = (tp / pred_pos).mean().item()
+        rec      = (tp / true_pos_cnt).mean().item()
+        denom    = prec + rec
+        if denom > 0:
+            best_fmax = max(best_fmax, 2 * prec * rec / denom)
 
     encoder.train(); generator.train()
-    return fmax
+    return best_fmax
