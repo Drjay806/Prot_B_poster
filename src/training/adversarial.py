@@ -238,33 +238,37 @@ def train_adversarial(
 
 def _get_has_function_rel_idx(encoder: CompGCN) -> int:
     """
-    Find the relation index for the protein→GO edge type.
-
-    Must prefer 'protein_function' over 'function_function' — both contain
-    'function' but the latter is the GO hierarchy edge (GO→GO), which gives
-    near-zero DistMult scores for protein-GO pairs.
+    Find the relation index for the protein→GO function edge type.
+    Prints all available relation names on every call for debugging.
     """
     rels = encoder.rel_name_to_idx
+    print(f"[rel_idx] available relations: {list(rels.keys())}")
 
-    # Pass 1: must contain 'protein'
+    # Pass 1: contains BOTH 'protein' and 'function' (e.g. 'protein_function')
     for rel, idx in rels.items():
-        if "protein" in rel.lower():
-            print(f"[rel_idx] found '{rel}' → {idx}")
+        if "protein" in rel.lower() and "function" in rel.lower():
+            print(f"[rel_idx] selected '{rel}' → {idx}")
             return idx
 
-    # Pass 2: contains 'annotation'
+    # Pass 2: exact functional annotation names
     for rel, idx in rels.items():
-        if "annotation" in rel.lower():
-            print(f"[rel_idx] found '{rel}' → {idx}")
+        if rel.lower() in ("has_function", "annotated_with", "go_annotation"):
+            print(f"[rel_idx] selected '{rel}' → {idx}")
             return idx
 
-    # Pass 3: contains 'function' but is not the GO-GO hierarchy edge
+    # Pass 3: contains 'function' but not the GO-GO hierarchy edge
     for rel, idx in rels.items():
         if "function" in rel.lower() and rel.lower() != "function_function":
-            print(f"[rel_idx] found '{rel}' → {idx}")
+            print(f"[rel_idx] selected '{rel}' → {idx}")
             return idx
 
-    print(f"[rel_idx] fallback: using idx 0 from {list(rels.keys())}")
+    # Pass 4: contains 'annotation'
+    for rel, idx in rels.items():
+        if "annotation" in rel.lower():
+            print(f"[rel_idx] selected '{rel}' → {idx}")
+            return idx
+
+    print(f"[rel_idx] WARNING: no protein→GO relation found, using idx 0")
     return 0
 
 
