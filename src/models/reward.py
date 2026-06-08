@@ -89,14 +89,13 @@ class RewardModule(nn.Module):
 
         reward = w1 * r_struct + w2 * r_adv + w3 * r_sem - self.lambda_hier * p_hier
         return reward, {
-            "structural": r_struct.mean().item(),
-            "adversarial": r_adv.mean().item(),
-            "semantic": r_sem.mean().item(),
-            "hierarchy_penalty": p_hier.mean().item(),
+            "reward/structural": r_struct.mean().item(),
+            "reward/adversarial": r_adv.mean().item(),
+            "reward/semantic": r_sem.mean().item(),
+            "reward/hierarchy_penalty": p_hier.mean().item(),
             "curriculum/w1": w1.item(),
             "curriculum/w2": w2.item(),
-            "curriculum/w3": (w3 * self._curriculum_multiplier).item() if self._curriculum_multiplier else 0.0,
-            "curriculum/w3_raw": w3.item(),
+            "curriculum/w3": w3.item(),
         }
 
     @torch.no_grad()
