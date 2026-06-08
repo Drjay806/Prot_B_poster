@@ -41,7 +41,7 @@ def evaluate_all(
     encoder.eval(); generator.eval()
 
     print("Encoding graph ...")
-    with torch.no_grad(), torch.amp.autocast('cuda'):
+    with torch.no_grad():
         protein_embs, go_embs, rel_embs = encoder(data)
     rel_idx = _get_has_function_rel_idx(encoder)
     rel_vec  = rel_embs[rel_idx].detach()
@@ -59,8 +59,21 @@ def evaluate_all(
         prop_edges = build_propagation_edges(data, target_type)
 
     # ── Streaming Fmax ───────────────────────────────────────────────────────────
+    # Pre-normalise for cosine scoring — encoder was trained with cosine/dot objective;
+    # DistMult relation vector was never trained, so cosine similarity is the correct scorer.
+    p_norm = torch.nn.functional.normalize(protein_embs.float(), dim=-1)   # [N_p, D]
+    g_norm = torch.nn.functional.normalize(go_embs.float(), dim=-1)        # [N_go, D]
+
+    # Discover actual score range with a small probe so thresholds cover it properly
+    with torch.no_grad():
+        probe = (p_norm[:min(500, n_p)] @ g_norm.t()).cpu()
+    score_min = float(probe.min())
+    score_max = float(probe.max())
+    del probe
+
     print(f"Computing Fmax (streaming over {n_p:,} proteins in chunks of {chunk_size}) ...")
-    thresholds = [t / t_steps for t in range(t_steps + 1)]
+    print(f"  Score range probe: [{score_min:.3f}, {score_max:.3f}] — thresholds span this range")
+    thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
     sum_prec   = np.zeros(t_steps + 1)
     sum_rec    = np.zeros(t_steps + 1)
     n_counted  = 0
@@ -69,11 +82,9 @@ def evaluate_all(
         prot_end  = min(prot_start + chunk_size, n_p)
         chunk_len = prot_end - prot_start
 
-        # Score [chunk, N_go] on GPU, move to CPU immediately
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            chunk_scores = torch.sigmoid(
-                distmult.score_all(protein_embs[prot_start:prot_end], rel_vec, go_embs)
-            ).cpu()
+        # Cosine similarity [chunk, N_go] on GPU, move to CPU immediately
+        with torch.no_grad():
+            chunk_scores = (p_norm[prot_start:prot_end] @ g_norm.t()).cpu()
 
         # True labels for this chunk (sparse → dense in-chunk only)
         chunk_mask = (row_cpu >= prot_start) & (row_cpu < prot_end)
@@ -127,10 +138,8 @@ def evaluate_all(
     auc_true  = torch.zeros(len(sel), n_go, dtype=torch.float32)
     auc_true[auc_row, auc_col] = 1.0
 
-    with torch.no_grad(), torch.amp.autocast('cuda'):
-        auc_scores = torch.sigmoid(
-            distmult.score_all(protein_embs[sel.to(device)], rel_vec, go_embs)
-        ).cpu()
+    with torch.no_grad():
+        auc_scores = (p_norm[sel.to(device)] @ g_norm.t()).cpu()
 
     if propagate and prop_edges:
         _propagate_chunk(auc_scores, prop_edges)
