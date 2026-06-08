@@ -72,7 +72,6 @@ class TrainingLogger:
         if "loss/critic" in metrics:
             crit   = metrics.get("loss/critic", 0)
             g      = metrics.get("loss/gen", 0)
-            gp     = metrics.get("loss/gp", 0)
             dm     = metrics.get("reward/distmult_mean", 0)
             sr     = metrics.get("scores/real", 0)
             sf     = metrics.get("scores/fake", 0)
@@ -84,7 +83,7 @@ class TrainingLogger:
             fmax_str = f"  val_Fmax={fmax:.4f}" if fmax is not None else ""
             print(
                 f"[Adv Epoch {epoch}/{total}] "
-                f"W_dist={w_dist:.3f}  C_loss={crit:.3f}(gp={gp:.2f})  G_loss={g:.3f}  "
+                f"W_dist={w_dist:.3f}  C_loss={crit:.3f}  G_loss={g:.3f}  "
                 f"scores(real={sr:.2f} fake={sf:.2f} hard={sh:.2f})  "
                 f"DistMult={dm:.3f}  acc(real={ra*100:.0f}% fake={fa*100:.0f}%)"
                 f"  {fmax_str}"

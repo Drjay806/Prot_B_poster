@@ -17,39 +17,6 @@ from src.utils.logger import TrainingLogger
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gradient penalty
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _gradient_penalty(
-    critic:      nn.Module,
-    real_p:      Tensor,   # [B, D_prot]
-    real_go:     Tensor,   # [B, D_go]
-    fake_go:     Tensor,   # [B, D_go]
-    lambda_gp:   float,
-    device:      str,
-) -> Tensor:
-    """
-    WGAN-GP gradient penalty (Gulrajani et al., NeurIPS 2017).
-    Interpolates between real and generated GO embeddings, penalises
-    ||∇_x̂ D(protein, x̂)||₂ deviating from 1.
-    """
-    B = real_go.size(0)
-    alpha = torch.rand(B, 1, device=device)
-    x_hat = (alpha * real_go + (1 - alpha) * fake_go.detach()).requires_grad_(True)
-
-    score = critic(real_p, x_hat)   # [B, 1]
-    ones  = torch.ones_like(score)
-    grads = torch.autograd.grad(
-        outputs=score, inputs=x_hat,
-        grad_outputs=ones,
-        create_graph=True, retain_graph=True,
-    )[0]                             # [B, D_go]
-
-    gp = lambda_gp * ((grads.norm(2, dim=-1) - 1) ** 2).mean()
-    return gp
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main training function
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -80,8 +47,7 @@ def train_adversarial(
     adv_cfg    = cfg["adversarial"]
     epochs     = adv_cfg["epochs"]
     batch_size = adv_cfg["batch_size"]
-    n_critic   = adv_cfg.get("n_critic", 5)
-    lambda_gp  = adv_cfg.get("lambda_gp", 10.0)
+    n_critic   = adv_cfg.get("n_critic", 1)
     grad_clip  = adv_cfg.get("grad_clip", 1.0)
     eval_every = adv_cfg.get("eval_every", 5)
     log_every  = adv_cfg.get("log_every_steps", 25)
@@ -117,7 +83,7 @@ def train_adversarial(
     )
 
     print(f"Starting adversarial training: {epochs} epochs, {len(row):,} positive pairs")
-    print(f"  WGAN-GP | n_critic={n_critic} | lambda_gp={lambda_gp} | beta1={beta1} beta2={beta2}")
+    print(f"  WGAN + spectral norm | n_critic={n_critic} | beta1={beta1} beta2={beta2}")
 
     global_step = 0
     best_fmax   = 0.0
@@ -128,7 +94,7 @@ def train_adversarial(
         row_s_cpu      = row_s.cpu()
 
         epoch_metrics: Dict[str, list] = {k: [] for k in [
-            "loss/critic", "loss/gen", "loss/gp",
+            "loss/critic", "loss/gen",
             "reward/distmult_mean",
             "scores/real", "scores/fake", "scores/hard",
             "disc/real_acc", "disc/fake_acc",
@@ -178,10 +144,10 @@ def train_adversarial(
                 score_fake = discriminator.score(pos_p, fake_g)    # [B]
                 score_hard = discriminator.score(pos_p, hard_g)    # [B]
 
-                # Three-way Wasserstein loss: maximise real, minimise fake + hard
-                w_dist   = score_real.mean() - 0.5 * score_fake.mean() - 0.5 * score_hard.mean()
-                gp       = _gradient_penalty(discriminator, pos_p, pos_g, fake_g, lambda_gp, device)
-                loss_crit = -w_dist + gp
+                # Three-way Wasserstein loss: maximise real, minimise fake + hard.
+                # Lipschitz constraint enforced by spectral norm on critic weights.
+                w_dist    = score_real.mean() - 0.5 * score_fake.mean() - 0.5 * score_hard.mean()
+                loss_crit = -w_dist
 
                 loss_crit.backward()
                 torch.nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip)
@@ -210,7 +176,6 @@ def train_adversarial(
             step_metrics = {
                 "loss/critic":          loss_crit.item(),
                 "loss/gen":             loss_gen.item(),
-                "loss/gp":              gp.item(),
                 "reward/distmult_mean": dm_scores.detach().mean().item(),
                 "scores/real":          score_real.detach().mean().item(),
                 "scores/fake":          score_fake.detach().mean().item(),
@@ -243,7 +208,7 @@ def train_adversarial(
             fmax_str      = f"  val_Fmax={avg['val/fmax_bp']:.4f}" if "val/fmax_bp" in avg else ""
             print(
                 f"[Adv {epoch}/{epochs}] "
-                f"W_dist={w_dist_approx:.3f}  G_loss={avg['loss/gen']:.3f}  "
+                f"W_dist={w_dist_approx:.3f}  C_loss={avg['loss/critic']:.3f}  G_loss={avg['loss/gen']:.3f}  "
                 f"scores(real={avg['scores/real']:.2f} fake={avg['scores/fake']:.2f} hard={avg['scores/hard']:.2f})  "
                 f"DistMult={avg['reward/distmult_mean']:.3f}  "
                 f"acc(real={avg['disc/real_acc']*100:.0f}% fake={avg['disc/fake_acc']*100:.0f}%)"

@@ -2,22 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.utils import spectral_norm
 
 
 class Critic(nn.Module):
     """
-    WGAN-GP critic for protein-function compatibility scoring.
+    WGAN critic for protein-function compatibility scoring.
 
-    Replaces the binary BCE discriminator. Outputs unbounded real scores —
-    high values indicate compatible (protein, GO) pairs, low values indicate
-    incompatible. Both inputs are L2-normalised before concatenation so the
-    critic learns directional protein-function relationships rather than
-    responding to embedding magnitude differences.
+    Uses spectral normalization on every linear layer to enforce a Lipschitz
+    constant of ≤1 per layer directly — more stable than gradient penalty
+    because it constrains the network weights rather than penalising gradient
+    norms at interpolated points (which misfires when inputs are pre-normalised).
+
+    Scores are unbounded reals. High = compatible pair, low = incompatible.
+    Both inputs are L2-normalised before concatenation so the critic responds
+    to directional protein-function relationships, not embedding magnitude.
 
     Trained with three input types:
       - Real      : annotated (protein, GO) pairs from the knowledge graph
       - Fake      : generator-produced GO embeddings
-      - Hard-neg  : plausible but unannotated GO terms sampled from the vocabulary
+      - Hard-neg  : plausible but unannotated GO terms (tiered negative sampler)
     """
 
     def __init__(self, cfg: dict):
@@ -30,9 +34,10 @@ class Critic(nn.Module):
         dims   = [in_dim] + hidden_dims + [1]
         layers = []
         for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            # spectral_norm caps the largest singular value of each weight matrix to 1,
+            # directly enforcing the Lipschitz constraint WGAN requires.
+            layers.append(spectral_norm(nn.Linear(dims[i], dims[i + 1])))
             if i < len(dims) - 2:
-                layers.append(nn.LayerNorm(dims[i + 1]))
                 layers.append(nn.LeakyReLU(neg_slope))
         self.net = nn.Sequential(*layers)
 
