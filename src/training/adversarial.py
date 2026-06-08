@@ -223,10 +223,34 @@ def train_adversarial(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _get_has_function_rel_idx(encoder: CompGCN) -> int:
-    """Find the relation index for 'has_function' (or the first protein→GO relation)."""
-    for rel, idx in encoder.rel_name_to_idx.items():
-        if "function" in rel.lower() or "annotation" in rel.lower():
+    """
+    Find the relation index for the protein→GO edge type.
+
+    Must prefer 'protein_function' over 'function_function' — both contain
+    'function' but the latter is the GO hierarchy edge (GO→GO), which gives
+    near-zero DistMult scores for protein-GO pairs.
+    """
+    rels = encoder.rel_name_to_idx
+
+    # Pass 1: must contain 'protein'
+    for rel, idx in rels.items():
+        if "protein" in rel.lower():
+            print(f"[rel_idx] found '{rel}' → {idx}")
             return idx
+
+    # Pass 2: contains 'annotation'
+    for rel, idx in rels.items():
+        if "annotation" in rel.lower():
+            print(f"[rel_idx] found '{rel}' → {idx}")
+            return idx
+
+    # Pass 3: contains 'function' but is not the GO-GO hierarchy edge
+    for rel, idx in rels.items():
+        if "function" in rel.lower() and rel.lower() != "function_function":
+            print(f"[rel_idx] found '{rel}' → {idx}")
+            return idx
+
+    print(f"[rel_idx] fallback: using idx 0 from {list(rels.keys())}")
     return 0
 
 
