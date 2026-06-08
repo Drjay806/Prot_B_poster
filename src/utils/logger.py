@@ -68,18 +68,41 @@ class TrainingLogger:
         print(f"[Pretrain Epoch {epoch}/{total}] {parts}{val_str}")
 
     def log_adv_epoch(self, epoch: int, total: int, metrics: Dict[str, float]):
-        d_real = metrics.get("loss/disc_real", 0)
-        d_fake = metrics.get("loss/disc_fake", 0)
-        g = metrics.get("loss/gen", 0)
-        dm = metrics.get("reward/distmult_mean", 0)
-        ra = metrics.get("disc/real_acc", 0)
-        fa = metrics.get("disc/fake_acc", 0)
-        fmax = metrics.get("val/fmax_bp", None)
-        fmax_str = f" | val_Fmax={fmax:.4f}" if fmax is not None else ""
-        print(
-            f"[Adv Epoch {epoch}/{total}] D_loss={d_real+d_fake:.3f} (real={d_real:.3f} fake={d_fake:.3f}) "
-            f"| G_loss={g:.3f} | DistMult={dm:.3f} | D_acc=real:{ra*100:.0f}% fake:{fa*100:.0f}%{fmax_str}"
-        )
+        # WGAN-GP keys
+        if "loss/critic" in metrics:
+            crit   = metrics.get("loss/critic", 0)
+            g      = metrics.get("loss/gen", 0)
+            gp     = metrics.get("loss/gp", 0)
+            dm     = metrics.get("reward/distmult_mean", 0)
+            sr     = metrics.get("scores/real", 0)
+            sf     = metrics.get("scores/fake", 0)
+            sh     = metrics.get("scores/hard", 0)
+            ra     = metrics.get("disc/real_acc", 0)
+            fa     = metrics.get("disc/fake_acc", 0)
+            w_dist = sr - 0.5 * sf - 0.5 * sh
+            fmax   = metrics.get("val/fmax_bp", None)
+            fmax_str = f"  val_Fmax={fmax:.4f}" if fmax is not None else ""
+            print(
+                f"[Adv Epoch {epoch}/{total}] "
+                f"W_dist={w_dist:.3f}  C_loss={crit:.3f}(gp={gp:.2f})  G_loss={g:.3f}  "
+                f"scores(real={sr:.2f} fake={sf:.2f} hard={sh:.2f})  "
+                f"DistMult={dm:.3f}  acc(real={ra*100:.0f}% fake={fa*100:.0f}%)"
+                f"  {fmax_str}"
+            )
+        else:
+            # Legacy BCE adversarial
+            d_real = metrics.get("loss/disc_real", 0)
+            d_fake = metrics.get("loss/disc_fake", 0)
+            g  = metrics.get("loss/gen", 0)
+            dm = metrics.get("reward/distmult_mean", 0)
+            ra = metrics.get("disc/real_acc", 0)
+            fa = metrics.get("disc/fake_acc", 0)
+            fmax = metrics.get("val/fmax_bp", None)
+            fmax_str = f" | val_Fmax={fmax:.4f}" if fmax is not None else ""
+            print(
+                f"[Adv Epoch {epoch}/{total}] D_loss={d_real+d_fake:.3f} (real={d_real:.3f} fake={d_fake:.3f}) "
+                f"| G_loss={g:.3f} | DistMult={dm:.3f} | D_acc=real:{ra*100:.0f}% fake:{fa*100:.0f}%{fmax_str}"
+            )
 
     def log_rl_epoch(self, epoch: int, total: int, metrics: Dict[str, float], is_best: bool = False):
         r = metrics.get("reward/total_mean", 0)
@@ -98,9 +121,18 @@ class TrainingLogger:
         )
 
     def check_health(self, step: int):
-        """Print warnings for common training failure modes."""
+        """
+        Print warnings for common training failure modes.
+
+        WGAN-GP semantics (when loss/critic is present, not loss/disc_total):
+          - gen_loss is unbounded; negative = generator winning, positive = critic winning.
+            A persistently large positive gen_loss means the critic dominates.
+          - W_dist (score_real − 0.5·score_fake − 0.5·score_hard) should be positive
+            and growing; if it stalls near zero the models have equilibrated too early.
+        """
         warnings = []
 
+        # ── Embedding collapse (pretrain and adversarial) ─────────────────────
         protein_norm = self._last("embed/protein_norm_mean")
         if protein_norm is not None and protein_norm < 0.01:
             warnings.append(f"  ⚠ EMBEDDING COLLAPSE: protein norm={protein_norm:.4f} < 0.01")
@@ -109,6 +141,7 @@ class TrainingLogger:
         if gen_output_norm is not None and gen_output_norm < 0.01:
             warnings.append(f"  ⚠ GENERATOR COLLAPSE: output norm={gen_output_norm:.4f} < 0.01")
 
+        # ── Legacy BCE discriminator checks (pretrain / old adversarial) ──────
         disc_total = self._last("loss/disc_total")
         if disc_total is not None:
             if disc_total < 0.01:
@@ -118,15 +151,34 @@ class TrainingLogger:
             if self._disc_zero_streak >= 5:
                 warnings.append(f"  ⚠ DISCRIMINATOR DOMINANCE: disc_loss≈0 for {self._disc_zero_streak*10} steps")
 
+        # ── WGAN-GP critic checks ─────────────────────────────────────────────
+        # gen_loss = -critic(fake).mean() − 0.5*DistMult.mean()
+        # Healthy range: negative (generator fools critic) → near 0 (equilibrium).
+        # Alarm: persistently large POSITIVE values → critic is dominating generator.
         gen_loss = self._last("loss/gen")
         if gen_loss is not None:
-            if gen_loss < 0.01:
-                self._gen_zero_streak += 1
+            is_wgan = self._last("loss/critic") is not None  # WGAN path logs loss/critic
+            if is_wgan:
+                # Critic domination: gen_loss >> 0 for many steps
+                if gen_loss > 5.0:
+                    self._gen_zero_streak += 1
+                else:
+                    self._gen_zero_streak = 0
+                if self._gen_zero_streak >= 5:
+                    warnings.append(
+                        f"  ⚠ CRITIC DOMINANCE: gen_loss={gen_loss:.2f} > 5.0 for "
+                        f"{self._gen_zero_streak*10} steps — critic overpowering generator"
+                    )
             else:
-                self._gen_zero_streak = 0
-            if self._gen_zero_streak >= 5:
-                warnings.append(f"  ⚠ MODE COLLAPSE: gen_loss≈0 for {self._gen_zero_streak*10} steps")
+                # Legacy BCE: gen_loss near 0 = mode collapse
+                if gen_loss < 0.01:
+                    self._gen_zero_streak += 1
+                else:
+                    self._gen_zero_streak = 0
+                if self._gen_zero_streak >= 5:
+                    warnings.append(f"  ⚠ MODE COLLAPSE: gen_loss≈0 for {self._gen_zero_streak*10} steps")
 
+        # ── Gradient explosion ────────────────────────────────────────────────
         gen_grad = self._last("grad/gen_norm")
         if gen_grad is not None and gen_grad > 5.0:
             warnings.append(f"  ⚠ GRADIENT EXPLOSION: gen_grad_norm={gen_grad:.2f} > 5.0 — consider lower lr")

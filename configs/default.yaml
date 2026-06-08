@@ -63,10 +63,11 @@ adversarial:
   lr_generator: 1.0e-4
   lr_critic: 1.0e-4
   lr_discriminator: 1.0e-4  # kept for backward compat
-  n_critic: 5               # critic updates per generator update (WGAN-GP standard)
-  lambda_gp: 10.0           # gradient penalty weight (Gulrajani 2017)
+  n_critic: 1               # 1:1 ratio for embedding space (5 causes critic to dominate)
+  lambda_gp: 1.0            # 10.0 overwhelms Wasserstein term at init in embedding space
   adam_beta1: 0.0           # WGAN-GP requires beta1=0
   adam_beta2: 0.9
+  lr_critic: 5.0e-5         # slower critic prevents dominance; generator at 1e-4
   grad_clip: 1.0
   eval_every: 5
   log_every_steps: 25
