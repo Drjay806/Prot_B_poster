@@ -317,14 +317,22 @@ def _quick_fmax(
     true_mat[s_row, s_col] = 1.0
 
     sampled_embs = protein_embs[unique_prots.to(device)]
-    scores = torch.sigmoid(distmult.score_all(sampled_embs, rel_vec, go_embs)).cpu()
 
-    # Proper Fmax: sweep thresholds, report the max F1.
-    # A fixed threshold of 0.5 fails when scores are compressed near 0 —
-    # thousands of wrong GO terms also cross 0.5, precision collapses to ~0.
+    # Pretrain uses plain dot-product (no relation vector) as ranking objective.
+    # Evaluating with DistMult+relation gives ~0 because the relation embedding
+    # was never trained to be a meaningful scaling factor.
+    # Use L2-normalised cosine similarity — matches what pretrain actually optimised.
+    p_norm = F.normalize(sampled_embs.float(), dim=-1)   # [B, D]
+    g_norm = F.normalize(go_embs.float(), dim=-1)         # [N_go, D]
+    scores = (p_norm @ g_norm.t()).cpu()                  # [B, N_go], range [-1, 1]
+
+    # Proper Fmax: sweep 50 thresholds across the actual score range.
     best_fmax    = 0.0
     true_pos_cnt = true_mat.sum(dim=1).clamp(min=1e-8)
-    for thresh in [t / 100 for t in range(0, 100, 2)]:
+    score_min = scores.min().item()
+    score_max = scores.max().item()
+    for t in range(51):
+        thresh   = score_min + t * (score_max - score_min) / 50
         pred     = (scores >= thresh).float()
         tp       = (pred * true_mat).sum(dim=1)
         pred_pos = pred.sum(dim=1).clamp(min=1e-8)
