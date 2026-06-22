@@ -56,6 +56,26 @@ def build_ancestor_table(
     return ancestor_table
 
 
+def build_direct_parents(
+    data: HeteroData,
+    target_type: str = "GO_term_P",
+) -> Dict[int, List[int]]:
+    """
+    Returns {child_go_idx: [direct_parent_idx, ...]} for immediate parents only.
+
+    Used by the order-consistency loss in Phase 1:
+        for each (protein, child_GO) annotation, the parent GO terms should score
+        at least as high as the child under ComplEx — penalised with a hinge loss
+        when parent scores lower.
+
+    Does NOT compute the transitive ancestor closure — use build_ancestor_table for that.
+    This is intentionally cheap: O(E) where E = number of hierarchy edges.
+    """
+    child_to_parents: Dict[int, list] = defaultdict(list)
+    _load_hierarchy_edges(data, target_type, child_to_parents)
+    return dict(child_to_parents)
+
+
 def build_propagation_edges(
     data: HeteroData,
     target_type: str = "GO_term_P",

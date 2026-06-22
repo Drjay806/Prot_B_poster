@@ -1,26 +1,57 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
 
-def infonce_loss(protein_embs: torch.Tensor, go_embs: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+def infonce_loss(
+    protein_embs: torch.Tensor,
+    go_embs: torch.Tensor,
+    temperature: float = 0.07,
+    neg_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
-    InfoNCE contrastive loss (NT-Xent, SimCLR — Chen et al. 2020).
+    Symmetric InfoNCE contrastive loss with optional false-negative masking.
+    (NT-Xent, SimCLR — Chen et al. 2020)
 
-    For a batch of B (protein, GO) pairs, every other GO term in the batch
-    becomes a negative for each protein.  This gives B-1 negatives per sample
-    automatically — 4,095 negatives at batch=4096, vs 5 in the old ranking loss.
+    WHY SYMMETRIC:
+        Old version only computed L_p2g (protein must rank its own GO highest).
+        We now also compute L_g2p (each GO term must rank its own protein highest).
+        The average is 0.5*(L_p2g + L_g2p).  This doubles the gradient signal per
+        batch at zero extra memory cost — the same [B,B] matrix is reused transposed.
 
-    The model must learn to rank the true GO term above ALL other GO terms
-    seen in the batch, which is exactly what Fmax measures at evaluation time.
+    WHY neg_mask (false-negative masking):
+        A protein typically has 10–50 true GO annotations.  If two proteins in the
+        same batch share a GO term, the "negative" pair is actually a known positive —
+        treating it as negative tells the model it did something wrong when it did not.
+        neg_mask[i,j]=True means protein_i's annotation includes GO_j (off-diagonal).
+        We set sim[i,j] = -inf before the softmax so those pairs don't contribute to
+        the loss.  Without this, InfoNCE penalises ~0.18% of its "negatives" falsely
+        (50/27855 per pair × 4096^2 ≈ 30k false penalties per batch).
 
-    Temperature 0.07 is the SimCLR default and works well for unit-sphere geometry.
+    neg_mask: [B, B] bool tensor where True = known off-diagonal positive.
+              Build with _build_false_neg_mask() in pretrain.py.
+              None = no masking (original behaviour).
     """
     p_norm = F.normalize(protein_embs, dim=-1)   # [B, D]
     g_norm = F.normalize(go_embs, dim=-1)         # [B, D]
-    sim = (p_norm @ g_norm.t()) / temperature      # [B, B]  — scaled cosine matrix
+    sim    = (p_norm @ g_norm.t()) / temperature  # [B, B] — scaled cosine
+
+    if neg_mask is not None:
+        # Set known off-diagonal positives to -inf so softmax ignores them.
+        # mask[i,j]=True means (protein_i, GO_j) is a real annotation — not a negative.
+        sim = sim.masked_fill(neg_mask, float('-inf'))
+
     labels = torch.arange(sim.size(0), device=sim.device)
-    # Protein i must rank GO i highest across all GO terms in the batch
-    return F.cross_entropy(sim, labels)
+
+    # Protein→GO: protein i should rank GO i highest across all GO in batch
+    l_p2g = F.cross_entropy(sim, labels)
+    # GO→Protein: GO i should rank protein i highest across all proteins in batch.
+    # sim.t() already carries the -inf mask at transposed positions, so
+    # (GO_j, protein_i) pairs that are true annotations are masked in both directions.
+    l_g2p = F.cross_entropy(sim.t(), labels)
+
+    return 0.5 * (l_p2g + l_g2p)
 
 
 def ranking_loss(pos_score: torch.Tensor, neg_score: torch.Tensor, margin: float = 0.5) -> torch.Tensor:

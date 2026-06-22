@@ -1,5 +1,5 @@
 import os
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -28,20 +28,37 @@ def train_rl(
     logger: Optional[TrainingLogger] = None,
 ) -> Tuple[CompGCN, Generator]:
     """
-    Phase 3: Generator fine-tuning with semantic + hierarchy-aware reward.
+    Phase 3: Generator fine-tuning with semantic + ancestor-similarity loss.
 
-    Replaces REINFORCE (which required a trained DistMult policy) with direct
-    gradient descent on a composite loss:
-        L = w_sem * (1 - cosine(fake_g, true_g))
-          + w_hier * hierarchy_penalty
-          + w_div  * -cosine_variance   (diversity across k samples)
+    Loss per batch:
+        L = w_sem  * (1 - cosine(fake_g, true_g))       [semantic]
+          + w_hier * (1 - cosine(fake_g, ancestor_g))    [hierarchy, avg over K sampled ancestors]
 
-    Curriculum linearly increases w_sem from 0 → 1 over warmup_epochs so the
-    generator first stabilises near the GO embedding manifold before being pushed
-    toward specific annotations.
+    WHY ANCESTOR-SIMILARITY REPLACES k_ancestors PENALTY:
+        The old hierarchy penalty:
+            1. Snapped fake_g to the nearest real GO term (non-differentiable step).
+            2. Looked up that GO term's ancestors.
+            3. Checked if those ancestors were in the protein's top-k cosine ranking.
+        Problems:
+            • k=100 was needed to avoid penalty=1.0 always — but 100 still left
+              many proteins fully penalised because their ancestors are sparse.
+            • The penalty was a detached constant (zero gradient on fake_g).
+            • The check was about the PROTEIN's neighbourhood, not the GENERATOR OUTPUT.
 
-    Encoder is frozen (computed once per epoch); only generator is updated.
-    Returns updated (encoder, generator).
+        The new ancestor-similarity loss:
+            1. For each (protein, true_GO) pair, sample K ancestors of true_GO.
+            2. Compute cosine(fake_g, ancestor_emb) directly — fully differentiable.
+            3. Penalty = 1 − mean cosine across sampled ancestors.
+        Benefits:
+            • Gradient flows directly through fake_g into the generator.
+            • The generator learns to land near ALL ancestors, not just the true GO.
+            • This encodes "if you predict a specific function, you should also be
+              near the more general functions above it in the hierarchy."
+            • No snapping, no constant penalty — smooth loss from epoch 1.
+
+    Curriculum: w_sem ramps linearly from 0 → 1 over warmup_epochs.
+    w_hier is always active at lambda_hier strength.
+    Encoder is frozen (computed once per epoch). Only generator is updated.
     """
     rl_cfg     = cfg["rl"]
     epochs     = rl_cfg["epochs"]
@@ -54,7 +71,7 @@ def train_rl(
 
     warmup_epochs = cfg["reward"].get("curriculum_warmup_epochs", 30)
     lambda_hier   = cfg["reward"].get("lambda_hier", 0.5)
-    k_anc         = cfg["reward"].get("k_ancestors", 20)
+    anc_k         = cfg["reward"].get("ancestor_sim_k", 8)
 
     target_type = cfg["data"]["target_type"]
 
@@ -67,16 +84,17 @@ def train_rl(
     rel_idx = _get_has_function_rel_idx(encoder)
 
     print(f"Starting RL training: {epochs} epochs, batch={batch_size}, k_samples={k_samples}")
+    print(f"  Hierarchy loss: ancestor-similarity (K={anc_k} ancestors sampled per GO)")
 
     best_fmax   = 0.0
     global_step = 0
 
     for epoch in range(1, epochs + 1):
 
-        # Curriculum weight: sem contribution ramps from 0 → 1 over warmup_epochs
+        # Curriculum: semantic weight ramps from 0 → 1 over warmup_epochs
         w_sem = min(epoch / max(warmup_epochs, 1), 1.0)
 
-        # ── Encoder forward: ONCE per epoch, no gradient ──────────────────────
+        # ── Encoder forward: once per epoch, no gradient ──────────────────────
         encoder.eval()
         with torch.no_grad():
             protein_embs, go_embs, rel_embs = encoder(train_data)
@@ -84,14 +102,11 @@ def train_rl(
         go_embs      = go_embs.detach()
         rel_vec      = rel_embs[rel_idx].detach()
 
-        # Pre-normalise GO embeddings once for hierarchy penalty scoring
-        go_norms = F.normalize(go_embs, dim=-1)   # [N_go, D]
-
         perm = torch.randperm(len(row), device=device)
         row_s, col_s = row[perm], col[perm]
 
-        epoch_sem  = []
-        epoch_hier = []
+        epoch_sem   = []
+        epoch_hier  = []
         epoch_gnorm = []
 
         for start in range(0, len(row_s), batch_size):
@@ -105,44 +120,26 @@ def train_rl(
             pos_p  = protein_embs[b_prot_idx]   # [B, D]
             true_g = go_embs[b_go_idx]           # [B, D]
 
-            # Sample k candidates and take the one most similar to true GO.
-            # Using semantic similarity (not DistMult) to select best candidate
-            # avoids a random policy corrupting the gradient direction.
+            # Sample k candidates; take the one most similar to the true GO.
             candidates = generator.sample(pos_p, rel_vec, k=k_samples)   # [B, k, D]
             with torch.no_grad():
-                true_g_exp = true_g.unsqueeze(1).expand_as(candidates)    # [B, k, D]
+                true_g_exp = true_g.unsqueeze(1).expand_as(candidates)
                 sem_per_k  = F.cosine_similarity(candidates, true_g_exp, dim=-1)  # [B, k]
-                best_k     = sem_per_k.argmax(dim=1)                      # [B]
+                best_k     = sem_per_k.argmax(dim=1)
             fake_g = candidates[torch.arange(B, device=device), best_k]   # [B, D]
 
-            # ── Semantic loss: push generator toward true GO direction ─────────
+            # ── Semantic loss ─────────────────────────────────────────────────
             sem_loss = (1.0 - F.cosine_similarity(fake_g, true_g)).mean()
 
-            # ── Hierarchy penalty: fake_g's nearest GO term should have its
-            #    ancestors covered in the protein's top-k cosine neighbourhood ──
-            with torch.no_grad():
-                fake_norm         = F.normalize(fake_g.detach(), dim=-1)
-                cos_to_vocab      = fake_norm @ go_norms.t()               # [B, N_go]
-                predicted_go_idxs = cos_to_vocab.argmax(dim=1)            # [B]
+            # ── Ancestor-similarity hierarchy loss ────────────────────────────
+            # For each protein, fake_g should be similar to all ancestors of true_GO.
+            # Fully differentiable: cosine(fake_g, ancestor_emb) has grad through fake_g.
+            hier_loss = _ancestor_sim_loss(
+                fake_g, b_go_idx, go_embs, ancestor_table, anc_k, device
+            )
 
-                # Top-k GO terms per protein by cosine (encoder already trained)
-                p_norm    = F.normalize(pos_p, dim=-1)
-                top_k_idx = (p_norm @ go_norms.t()).topk(k_anc, dim=-1).indices  # [B, k]
-
-            hier_penalties = []
-            for b in range(B):
-                go_idx    = predicted_go_idxs[b].item()
-                ancestors = ancestor_table.get(go_idx, frozenset())
-                if not ancestors:
-                    hier_penalties.append(0.0)
-                    continue
-                top_k_set = set(top_k_idx[b].tolist())
-                missing   = len(ancestors - top_k_set) / len(ancestors)
-                hier_penalties.append(missing)
-            hier_penalty = torch.tensor(hier_penalties, device=device).mean()
-
-            # Combined loss — sem weight ramps up with curriculum
-            loss = w_sem * sem_loss + lambda_hier * hier_penalty
+            # Combined loss
+            loss = w_sem * sem_loss + lambda_hier * hier_loss
 
             loss.backward()
             gnorm = torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
@@ -150,8 +147,8 @@ def train_rl(
 
             global_step += 1
 
-            sem_val  = 1.0 - sem_loss.item()   # cosine similarity (higher = better)
-            hier_val = hier_penalty.item()
+            sem_val   = 1.0 - sem_loss.item()
+            hier_val  = hier_loss.item()
             gnorm_val = gnorm if isinstance(gnorm, float) else gnorm.item()
 
             epoch_sem.append(sem_val)
@@ -161,23 +158,23 @@ def train_rl(
             if logger and global_step % log_every == 0:
                 logger.log({
                     "reward/semantic":          sem_val,
-                    "reward/hierarchy_penalty": hier_val,
+                    "reward/hierarchy_loss":    hier_val,
                     "grad/gen_norm":            gnorm_val,
                     "curriculum/w3":            w_sem,
                 }, step=global_step, phase="rl")
 
-        avg_sem  = sum(epoch_sem)  / max(len(epoch_sem),  1)
-        avg_hier = sum(epoch_hier) / max(len(epoch_hier), 1)
+        avg_sem   = sum(epoch_sem)   / max(len(epoch_sem),   1)
+        avg_hier  = sum(epoch_hier)  / max(len(epoch_hier),  1)
         avg_gnorm = sum(epoch_gnorm) / max(len(epoch_gnorm), 1)
 
         avg = {
-            "reward/total_mean":        avg_sem - lambda_hier * avg_hier,
-            "reward/structural":        0.0,
-            "reward/adversarial":       0.0,
-            "reward/semantic":          avg_sem,
-            "reward/hierarchy_penalty": avg_hier,
-            "grad/gen_norm":            avg_gnorm,
-            "curriculum/w3":            w_sem,
+            "reward/total_mean":     avg_sem - lambda_hier * avg_hier,
+            "reward/structural":     0.0,
+            "reward/adversarial":    0.0,
+            "reward/semantic":       avg_sem,
+            "reward/hierarchy_loss": avg_hier,
+            "grad/gen_norm":         avg_gnorm,
+            "curriculum/w3":         w_sem,
         }
 
         is_best = False
@@ -199,13 +196,66 @@ def train_rl(
             best_str = " *** NEW BEST" if is_best else ""
             print(
                 f"[RL Epoch {epoch}/{epochs}] "
-                f"sem={avg_sem:.3f}  hier_pen={avg_hier:.3f}  "
+                f"sem={avg_sem:.3f}  anc_sim={1.0-avg_hier:.3f}  "
                 f"w_sem={w_sem:.2f}  grad_norm={avg_gnorm:.3f}"
                 f"{fmax_str}{best_str}"
             )
 
     print(f"RL training complete. Best val Fmax: {best_fmax:.4f}")
     return encoder, generator
+
+
+def _ancestor_sim_loss(
+    fake_g: torch.Tensor,
+    b_go_idx: torch.Tensor,
+    go_embs: torch.Tensor,
+    ancestor_table: Dict[int, FrozenSet[int]],
+    anc_k: int,
+    device: str,
+) -> torch.Tensor:
+    """
+    Compute 1 - mean cosine(fake_g_i, ancestor_of_true_go_i) for all proteins.
+
+    WHY:
+        The generator's output fake_g should not only be near the true GO term
+        but also near that term's ancestors (parent, grandparent, etc.).
+        GO hierarchy requires: if a protein has function X, it also has all
+        more-general functions above X.  Pulling fake_g toward ancestors makes
+        the prediction semantically consistent with the ontology even before
+        the final label propagation step.
+
+    DIFFERENTIABLE:
+        cosine_similarity(fake_g, ancestor_emb) has a gradient through fake_g.
+        No snapping, no constant penalty — smooth signal from epoch 1.
+
+    Implementation: builds index tensors in a Python loop (O(batch_size)),
+    then does a single vectorised cosine_similarity call on [N_total, D].
+    """
+    all_fake   = []   # [K_i, D] repeated fake_g for each ancestor
+    all_anc    = []   # [K_i, D] ancestor embeddings
+
+    for b in range(fake_g.size(0)):
+        go_idx    = b_go_idx[b].item()
+        ancestors = list(ancestor_table.get(go_idx, frozenset()))
+        if not ancestors:
+            continue
+
+        k_use     = min(anc_k, len(ancestors))
+        # Take a deterministic prefix rather than random sample for reproducibility
+        anc_idx   = ancestors[:k_use]
+        anc_emb   = go_embs[torch.tensor(anc_idx, device=device)]   # [K, D]
+
+        all_fake.append(fake_g[b:b+1].expand(k_use, -1))  # [K, D]
+        all_anc.append(anc_emb)
+
+    if not all_fake:
+        return torch.tensor(0.0, device=device)
+
+    fake_cat = torch.cat(all_fake, dim=0)  # [total_K, D]
+    anc_cat  = torch.cat(all_anc,  dim=0)  # [total_K, D]
+
+    # 1 - cosine_similarity so loss decreases as fake_g moves toward ancestors
+    return (1.0 - F.cosine_similarity(fake_cat, anc_cat, dim=-1)).mean()
 
 
 def _save_checkpoint(encoder, generator, epoch: int, fmax: float, checkpoint_dir: str):

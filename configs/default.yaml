@@ -9,15 +9,14 @@ encoder:
   input_dim_go: 200
   hidden_dim: 256
   output_dim: 256
-  num_layers: 2
+  num_layers: 3             # was 2 — 3 layers gives deeper GO-hierarchy message passing
   composition: "ccorr"
   dropout_pretrain: 0.3
   dropout_adv: 0.1
   use_residual: true
   # Use ALL edge types in the knowledge graph.
   # Gradient checkpointing in CompGCN makes this memory-safe on T4.
-  # Edges are processed in 50k chunks serially — peak memory does not grow with
-  # edge count, only with number of node types (each adds a ~50 MB agg tensor).
+  # Edges are processed in 50k chunks — peak memory does not grow with edge count.
   # If OOM occurs, add specific edge types here to dial back selectively.
   gnn_edge_types: []
 
@@ -34,7 +33,6 @@ discriminator:
   hidden_dims: [512, 256]
   output_dim: 1
   negative_slope: 0.2
-  # label_smooth_* removed — WGAN-GP critic is unbounded, no sigmoid/BCE
 
 distmult:
   hidden_dim: 256
@@ -42,17 +40,23 @@ distmult:
 reward:
   lambda_hier: 0.5
   curriculum_warmup_epochs: 30
-  k_ancestors: 100    # was 20 — with 20, ALL predicted GO terms had ancestors not in top-k → penalty=1.0 always
+  # ancestor_sim_k: how many transitive ancestors to sample per GO term in Phase 3
+  # hierarchy loss.  Higher = stronger but slower per epoch (~8 is enough for signal).
+  ancestor_sim_k: 8
 
 pretrain:
   epochs: 50
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  # InfoNCE replaces the old 5-negative ranking loss.
-  # num_negatives here is only for the DistMult link-prediction auxiliary loss.
-  num_negatives: 32             # was 5
-  infonce_temperature: 0.07     # SimCLR default; lower = sharper separation
-  distmult_weight: 0.5          # weight on the DistMult LP loss
+  # num_negatives is only for the ComplEx link-prediction auxiliary loss.
+  # InfoNCE uses all S-1 in-batch GO terms as negatives automatically.
+  num_negatives: 32
+  infonce_temperature: 0.07       # SimCLR default; lower = sharper separation
+  distmult_weight: 0.5            # weight on the ComplEx LP loss
+  # order_consistency_weight: hinge penalty when ComplEx scores parent GO lower than child.
+  # Requires passing direct_parents=build_direct_parents(train_data) to pretrain().
+  # Set to 0.0 to skip (saves ~100ms/epoch; costs ~0.02 Fmax).
+  order_consistency_weight: 0.3
   eval_every: 10
   warmup_epochs: 10
   log_every_steps: 50
@@ -63,17 +67,18 @@ adversarial:
   lr_encoder: 1.0e-4
   lr_generator: 1.0e-4
   lr_critic: 1.0e-4
-  lr_discriminator: 1.0e-4  # kept for backward compat
-  n_critic: 2               # 2 critic steps per generator step — prevents fake > real
-  lambda_gp: 1.0            # kept for config compat (not used with spectral norm)
-  adam_beta1: 0.0           # WGAN requires beta1=0
+  lr_discriminator: 1.0e-4        # kept for backward compat
+  n_critic: 5                     # was 2 — 5 critic steps per generator step gives
+                                  # the Lipschitz critic time to separate real from fake
+                                  # before the generator is updated
+  lambda_gp: 1.0                  # kept for config compat (not used with spectral norm)
+  adam_beta1: 0.0                 # WGAN requires beta1=0
   adam_beta2: 0.9
-  lr_critic: 1.0e-4         # match generator lr; spectral norm prevents domination
   grad_clip: 1.0
   eval_every: 5
   log_every_steps: 25
   negative_sampling:
-    hard_neg_temperature: 0.5  # self-adversarial sampling temperature (RotatE, Sun 2019)
+    hard_neg_temperature: 0.5     # self-adversarial sampling temperature (RotatE, Sun 2019)
 
 rl:
   epochs: 50
@@ -90,7 +95,7 @@ evaluation:
   propagate_hierarchy: true
   score_chunk_size: 1000
   # Hybrid scoring weight for generator output.
-  # Final score = (1-gen_weight)*encoder_cosine + gen_weight*generator_cosine
-  # Set to 0.0 to use encoder-only (ablation baseline).
+  # Final score = (1 - gen_weight)*ComplEx_score + gen_weight*generator_cosine
+  # Set to 0.0 for encoder-only ablation (ComplEx only, no generator).
   # Set to 0.3 for normal use after Phase 3 completes.
   gen_weight: 0.3

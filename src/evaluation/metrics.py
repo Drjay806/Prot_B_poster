@@ -1,6 +1,7 @@
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from torch_geometric.data import HeteroData
@@ -12,7 +13,7 @@ from src.data.graph_builder import build_annotation_matrix
 from src.data.go_hierarchy import build_propagation_edges
 from src.training.adversarial import _get_has_function_rel_idx
 
-# Max proteins to materialise at once — [1000 x 27855] = 27M floats = 108 MB, safe on T4
+# Max proteins to materialise at once — ComplEx [1000 x 27855] = ~27M floats = 108 MB, safe on T4
 _SCORE_CHUNK = 1000
 # Proteins sampled for AUROC/AUPR (full flattened matrix is too large for sklearn)
 _AUC_SAMPLE  = 8000
@@ -32,6 +33,26 @@ def evaluate_all(
     """
     Full evaluation matching ProtHGT's protocol.
     Streams proteins in chunks so we never hold a [N_p x N_go] tensor in memory.
+
+    Scoring (v3 — ComplEx primary):
+        Encoder path:  ComplEx score(protein, has_function, GO)   — matches training objective
+        Generator path: cosine(generated_GO_emb, all_real_GO_embs) — directional boost
+
+        Final score = enc_weight * ComplEx_score + gen_weight * generator_cosine
+
+    WHY ComplEx instead of cosine for the encoder:
+        Phase 1 explicitly trains ComplEx link prediction — the ComplEx scorer
+        learned to separate has_function positives from negatives.  Using ComplEx
+        at eval time therefore uses the signal that was actually trained.
+        Cosine ignores the trained relation embedding entirely and reverts to
+        raw geometric proximity, which is weaker for asymmetric one-to-many relations.
+
+    WHY keep cosine for the generator path:
+        The generator outputs a synthetic GO embedding, not a protein embedding.
+        Cosine similarity of the generated point versus all real GO embeddings tells
+        us "which real GO term does the generator think is right."  There is no
+        meaningful ComplEx triple (fake_GO, rel, real_GO) — the relation links
+        proteins to GOs, not GOs to GOs.
     """
     eval_cfg   = cfg.get("evaluation", {})
     t_steps    = eval_cfg.get("threshold_steps", 100)
@@ -43,41 +64,25 @@ def evaluate_all(
     print("Encoding graph ...")
     with torch.no_grad():
         protein_embs, go_embs, rel_embs = encoder(data)
-    rel_idx = _get_has_function_rel_idx(encoder)
+    rel_idx  = _get_has_function_rel_idx(encoder)
     rel_vec  = rel_embs[rel_idx].detach()
     protein_embs = protein_embs.detach()
     go_embs      = go_embs.detach()
+
+    # g_norm is used by the generator cosine path (fake_go vs real GO embs)
+    g_norm = F.normalize(go_embs.float(), dim=-1)   # [N_go, D]
 
     # Sparse ground-truth annotations
     row, col, n_p, n_go = build_annotation_matrix(data, target_type)
     row_cpu, col_cpu = row.cpu(), col.cpu()
 
-    # Propagation edges (topological order) — used instead of ancestor_table for memory safety
     prop_edges: List[Tuple[int, int]] = []
     if propagate:
         print("Loading propagation edges ...")
         prop_edges = build_propagation_edges(data, target_type)
 
-    # ── Streaming Fmax ───────────────────────────────────────────────────────────
-    # Hybrid scoring: encoder cosine similarity + generator-guided similarity.
-    #
-    # Encoder cosine: direct lookup of protein embedding vs all GO embeddings.
-    # Generator path: protein → generator → predicted GO embedding → cosine vs all GO.
-    #
-    # Why combine both:
-    #   Encoder cosine alone is pure lookup — same as ProtHGT minus the richer graph.
-    #   The generator was trained (Phase 3) to navigate toward the correct region of
-    #   GO space.  Its predicted embedding should sit closer to the true GO terms than
-    #   the raw protein embedding, because it was explicitly pushed there by RL.
-    #   Averaging the two signals is more accurate than either alone.
-    #
-    # gen_weight=0.3 is conservative — encoder is the trusted signal, generator adds
-    # a directional boost.  Set gen_weight=0.0 to fall back to encoder-only.
     gen_weight = eval_cfg.get("gen_weight", 0.3)
     enc_weight = 1.0 - gen_weight
-
-    p_norm = torch.nn.functional.normalize(protein_embs.float(), dim=-1)   # [N_p, D]
-    g_norm = torch.nn.functional.normalize(go_embs.float(), dim=-1)        # [N_go, D]
 
     # Precompute generator output for all proteins (deterministic: noise=0)
     if gen_weight > 0:
@@ -91,27 +96,34 @@ def evaluate_all(
                 rel_chunk = rel_vec.unsqueeze(0).expand(ge - gs, -1)
                 noise     = torch.zeros(ge - gs, generator.noise_dim, device=device)
                 fake_go   = generator(chunk_p, rel_chunk, noise)
-            gen_chunks.append(torch.nn.functional.normalize(fake_go.float(), dim=-1).cpu())
-        gen_p_norm = torch.cat(gen_chunks, dim=0)   # [N_p, D] — normalised generator output
+            gen_chunks.append(F.normalize(fake_go.float(), dim=-1).cpu())
+        gen_p_norm = torch.cat(gen_chunks, dim=0)   # [N_p, D] normalised generator output
         del gen_chunks
     else:
         gen_p_norm = None
 
-    # Discover actual score range with a small probe so thresholds cover it properly
+    # Discover actual score range with a small ComplEx probe
+    print("Probing ComplEx score range ...")
+    probe_end = min(500, n_p)
     with torch.no_grad():
-        enc_probe = (p_norm[:min(500, n_p)] @ g_norm.t()).cpu()
+        enc_probe = distmult.score_all(
+            protein_embs[:probe_end].float(),
+            rel_vec.float(),
+            go_embs.float()
+        ).cpu()
         if gen_p_norm is not None:
-            gen_probe = (gen_p_norm[:min(500, n_p)].to(device) @ g_norm.t()).cpu()
+            gen_probe = (gen_p_norm[:probe_end].to(device) @ g_norm.t()).cpu()
             probe = enc_weight * enc_probe + gen_weight * gen_probe
         else:
             probe = enc_probe
+
     score_min = float(probe.min())
     score_max = float(probe.max())
     del probe
 
     print(f"Computing Fmax (streaming over {n_p:,} proteins in chunks of {chunk_size}) ...")
     print(f"  Score range probe: [{score_min:.3f}, {score_max:.3f}]")
-    print(f"  Scoring: {enc_weight:.1f}×encoder_cosine + {gen_weight:.1f}×generator_cosine")
+    print(f"  Scoring: {enc_weight:.1f}×ComplEx + {gen_weight:.1f}×generator_cosine")
     thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
     sum_prec   = np.zeros(t_steps + 1)
     sum_rec    = np.zeros(t_steps + 1)
@@ -122,14 +134,20 @@ def evaluate_all(
         chunk_len = prot_end - prot_start
 
         with torch.no_grad():
-            enc_scores = (p_norm[prot_start:prot_end] @ g_norm.t()).cpu()
+            # Primary: ComplEx score — uses the trained relation embedding
+            enc_scores = distmult.score_all(
+                protein_embs[prot_start:prot_end].float(),
+                rel_vec.float(),
+                go_embs.float()
+            ).cpu()
+
             if gen_p_norm is not None:
+                # Secondary: cosine similarity of generated point vs all real GO embs
                 gen_scores = (gen_p_norm[prot_start:prot_end].to(device) @ g_norm.t()).cpu()
                 chunk_scores = enc_weight * enc_scores + gen_weight * gen_scores
             else:
                 chunk_scores = enc_scores
 
-        # True labels for this chunk (sparse → dense in-chunk only)
         chunk_mask = (row_cpu >= prot_start) & (row_cpu < prot_end)
         c_row = row_cpu[chunk_mask] - prot_start
         c_col = col_cpu[chunk_mask]
@@ -141,7 +159,6 @@ def evaluate_all(
             _propagate_chunk(chunk_true, prop_edges)
         chunk_true = (chunk_true > 0.5).float()
 
-        # Skip proteins with no annotations in this split
         has_annot = chunk_true.any(dim=1)
         if not has_annot.any():
             continue
@@ -166,7 +183,7 @@ def evaluate_all(
             if f1 > best_f1:
                 best_f1, best_t = f1, t
 
-    # ── AUROC / AUPR on a random protein sample ──────────────────────────────────
+    # ── AUROC / AUPR on a random protein sample using ComplEx scores ──────────────
     print(f"Computing AUROC / AUPR (sample of {_AUC_SAMPLE:,} proteins) ...")
     unique_prots = row_cpu.unique()
     if len(unique_prots) > _AUC_SAMPLE:
@@ -182,7 +199,11 @@ def evaluate_all(
     auc_true[auc_row, auc_col] = 1.0
 
     with torch.no_grad():
-        auc_scores = (p_norm[sel.to(device)] @ g_norm.t()).cpu()
+        auc_scores = distmult.score_all(
+            protein_embs[sel.to(device)].float(),
+            rel_vec.float(),
+            go_embs.float()
+        ).cpu()
 
     if propagate and prop_edges:
         _propagate_chunk(auc_scores, prop_edges)
@@ -192,7 +213,7 @@ def evaluate_all(
     col_has_pos   = auc_true.sum(dim=0) > 0
     y_true_flat   = auc_true[:, col_has_pos].numpy().ravel()
     y_score_flat  = auc_scores[:, col_has_pos].numpy().ravel()
-    auroc = roc_auc_score(y_true_flat, y_score_flat)       if y_true_flat.sum() > 0 else 0.0
+    auroc = roc_auc_score(y_true_flat, y_score_flat)        if y_true_flat.sum() > 0 else 0.0
     aupr  = average_precision_score(y_true_flat, y_score_flat) if y_true_flat.sum() > 0 else 0.0
 
     # ── Micro / Macro F1 at best threshold ───────────────────────────────────────
