@@ -94,3 +94,43 @@ def build_dense_annotation_matrix(
 
 def get_node_counts(data: HeteroData) -> Dict[str, int]:
     return {ntype: data[ntype].x.shape[0] for ntype in data.node_types if hasattr(data[ntype], "x") and data[ntype].x is not None}
+
+
+def validate_split_disjointness(
+    train_data: HeteroData,
+    test_data:  HeteroData,
+    target_type: str,
+    src_type:   str = "Protein",
+    relation:   str = "protein_function",
+) -> bool:
+    """
+    Confirm that no test protein appears in training protein→GO annotation edges.
+
+    WHY THIS MATTERS:
+        ProtHGT uses a cold-start protein-level split: test proteins must be
+        entirely absent from training annotations.  If test proteins appear in
+        train edges, the encoder has seen their labels — Fmax numbers are inflated
+        and the comparison with ProtHGT's published numbers is invalid.
+
+    Raises ValueError listing the overlap size if leakage is detected.
+    Prints "split OK" if the split is clean.
+    Returns True on success (so it can be used in assertions).
+    """
+    train_row, _, _, _ = build_annotation_matrix(train_data, target_type, src_type, relation)
+    test_row,  _, _, _ = build_annotation_matrix(test_data,  target_type, src_type, relation)
+
+    train_prots = set(train_row.cpu().tolist())
+    test_prots  = set(test_row.cpu().tolist())
+    overlap     = train_prots & test_prots
+
+    if overlap:
+        raise ValueError(
+            f"Split leakage detected for {target_type}: "
+            f"{len(overlap):,} test proteins also appear in train annotations "
+            f"(e.g. indices {sorted(overlap)[:5]}...). "
+            f"Evaluation numbers would be inflated."
+        )
+
+    print(f"  {target_type}: split OK — "
+          f"{len(train_prots):,} train proteins / {len(test_prots):,} test proteins / 0 overlap")
+    return True

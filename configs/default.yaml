@@ -94,8 +94,18 @@ evaluation:
   threshold_steps: 100
   propagate_hierarchy: true
   score_chunk_size: 1000
-  # Hybrid scoring weight for generator output.
-  # Final score = (1 - gen_weight)*ComplEx_score + gen_weight*generator_cosine
-  # Set to 0.0 for encoder-only ablation (ComplEx only, no generator).
-  # Set to 0.3 for normal use after Phase 3 completes.
-  gen_weight: 0.3
+  # Generator cosine contribution to encoder score.
+  # Set to 0.0 for Conditions 1-4 in the ablation table (encoder/critic/ensemble modes).
+  # Set to 0.3 only when you explicitly want to blend the generator into the encoder path.
+  gen_weight: 0.0
+  # Scoring mode for evaluate_all / evaluate_all_ontologies:
+  #   "encoder"  — ComplEx score(protein, has_function, GO) [default, matches training]
+  #   "critic"   — WGAN critic score(protein, GO) for all GO terms [diagnostic]
+  #   "ensemble" — alpha*ComplEx + (1-alpha)*critic [tune alpha on val first]
+  mode: "encoder"
+  # ComplEx weight in ensemble mode (0.0 = critic only, 1.0 = ComplEx only).
+  # Run tune_ensemble_alpha() on val data to set this automatically.
+  ensemble_alpha: 0.7
+  # Critic scoring chunk sizes (reduce if T4 OOM during mode="critic" eval).
+  protein_chunk_size: 64    # proteins per outer loop in critic_score_all
+  go_chunk_size: 512        # GO terms per inner loop in critic_score_all
