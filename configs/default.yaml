@@ -9,16 +9,37 @@ encoder:
   input_dim_go: 200
   hidden_dim: 256
   output_dim: 256
-  num_layers: 3             # was 2 — 3 layers gives deeper GO-hierarchy message passing
+  num_layers: 2             # T4 14.6 GB: gradient checkpoint stores N_layers sets of
+                            # full node_embs (all types × nodes × 256). 3 layers fills
+                            # GPU before any chunk runs. 2 layers is the safe ceiling.
   composition: "ccorr"
   dropout_pretrain: 0.3
   dropout_adv: 0.1
   use_residual: true
-  # Use ALL edge types in the knowledge graph.
-  # Gradient checkpointing in CompGCN makes this memory-safe on T4.
-  # Edges are processed in 50k chunks — peak memory does not grow with edge count.
-  # If OOM occurs, add specific edge types here to dial back selectively.
-  gnn_edge_types: []
+  # Focused edge-type whitelist for T4 memory budget.
+  # ALL edge types = gradient checkpoint stores Chembl/Disease/Drug node_embs (~2-5 GB each)
+  # simultaneously for every layer.  Whitelist keeps only protein-function-relevant edges
+  # (Protein↔GO, GO hierarchy, PPI, domain, pathway, orthology) — excludes large-DB types.
+  # To re-enable all types, set gnn_edge_types: []  (needs >20 GB GPU).
+  gnn_edge_types:
+    - protein_function
+    - rev_protein_function
+    - function_function
+    - rev_function_function
+    - PPI
+    - rev_PPI
+    - protein_domain
+    - rev_protein_domain
+    - domain_function
+    - rev_domain_function
+    - Pathway
+    - rev_Pathway
+    - kegg_path_prot
+    - rev_kegg_path_prot
+    - Orthology
+    - rev_Orthology
+    - protein_ec
+    - rev_protein_ec
 
 generator:
   protein_dim: 256
