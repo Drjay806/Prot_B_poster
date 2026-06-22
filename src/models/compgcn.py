@@ -187,18 +187,30 @@ class CompGCN(nn.Module):
                 idx = torch.arange(data[ntype].num_nodes, device=device)
                 node_embs[ntype] = proj(idx)
             else:
-                # Run projection without grad.  Avoids holding 261k×1280 raw features
-                # (1.3 GB) in the autograd graph — nested _ck calls cause the checkpoint
-                # engine to save the full graph context for every nesting level, which
-                # OOMs on T4 before a single GCN chunk can run.
-                # GCN weights (W_O / W_I / W_S) receive full gradients via message
-                # passing; only the input-projection Linear weights are frozen here.
+                # Project raw features without grad to avoid holding 261k×1280=1.3 GB
+                # in the autograd graph.  Then re-enable requires_grad on the OUTPUT.
+                #
+                # Why requires_grad_(True) is critical:
+                #   PyTorch 2.1 saved_tensors_hooks (used by use_reentrant=False
+                #   checkpoint) only intercepts saves of tensors with requires_grad=True.
+                #   Without it, GCN intermediates derived from node_embs (e_src, fa,
+                #   composed) all have requires_grad=False.  Autograd still saves each
+                #   chunk's 'composed' tensor to compute W_O.weight.grad — but the hook
+                #   never intercepts it.  With PPI having millions of edges at 5k-edge
+                #   chunks, thousands of 10 MB 'composed' tensors accumulate = 14 GB OOM.
+                #   Setting requires_grad=True here makes all GCN intermediates inherit
+                #   requires_grad=True, so the checkpoint hook CAN intercept and discard
+                #   their saves (recomputing them during backward instead of storing them).
+                #
+                # Memory: 'emb' is a leaf tensor (no grad_fn).  Its .grad accumulates
+                # during backward but is freed when 'emb' goes out of scope after the
+                # checkpoint releases its saved-tensor references post-backward.
                 with torch.no_grad():
                     x = data[ntype].x.to(device)
                     emb = proj(x)
                     del x
-                node_embs[ntype] = emb
-        torch.cuda.empty_cache()   # release freed raw-feature blocks before GCN forward
+                node_embs[ntype] = emb.requires_grad_(True)
+        torch.cuda.empty_cache()   # flush freed raw-feature blocks before GCN forward
         return node_embs
 
     def _build_edge_info(self, data: HeteroData):
