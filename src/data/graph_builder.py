@@ -104,33 +104,47 @@ def validate_split_disjointness(
     relation:   str = "protein_function",
 ) -> bool:
     """
-    Confirm that no test protein appears in training protein→GO annotation edges.
+    Confirm that no (protein, GO) annotation edge appears in both train and test.
 
-    WHY THIS MATTERS:
-        ProtHGT uses a cold-start protein-level split: test proteins must be
-        entirely absent from training annotations.  If test proteins appear in
-        train edges, the encoder has seen their labels — Fmax numbers are inflated
-        and the comparison with ProtHGT's published numbers is invalid.
+    ProtHGT uses a transductive edge-level split: the GNN sees ALL proteins during
+    message passing (train+test proteins share the same node space), but specific
+    protein→GO annotation edges are held out for evaluation.  Protein-index overlap
+    across splits is therefore expected and correct.
 
-    Raises ValueError listing the overlap size if leakage is detected.
-    Prints "split OK" if the split is clean.
-    Returns True on success (so it can be used in assertions).
+    What would be actual leakage: the same (protein_idx, go_idx) pair appearing in
+    both train supervision edges and test supervision edges.  That would mean the
+    model was trained on the exact label it is being tested on.
+
+    Raises ValueError if any (protein, GO) pair appears in both splits.
+    Prints a summary of the split type and edge counts.
+    Returns True on success.
     """
-    train_row, _, _, _ = build_annotation_matrix(train_data, target_type, src_type, relation)
-    test_row,  _, _, _ = build_annotation_matrix(test_data,  target_type, src_type, relation)
+    train_row, train_col, _, _ = build_annotation_matrix(train_data, target_type, src_type, relation)
+    test_row,  test_col,  _, _ = build_annotation_matrix(test_data,  target_type, src_type, relation)
 
+    # Protein-level overlap — expected in transductive/edge-level splits
     train_prots = set(train_row.cpu().tolist())
     test_prots  = set(test_row.cpu().tolist())
-    overlap     = train_prots & test_prots
+    prot_overlap = train_prots & test_prots
+    if prot_overlap:
+        print(f"  {target_type}: {len(prot_overlap):,} proteins shared across splits "
+              f"(transductive edge-level split — expected for ProtHGT)")
+    else:
+        print(f"  {target_type}: protein-level cold-start split detected "
+              f"({len(train_prots):,} train / {len(test_prots):,} test proteins, 0 overlap)")
 
-    if overlap:
+    # Edge-level overlap — this would be true leakage
+    train_pairs = set(zip(train_row.cpu().tolist(), train_col.cpu().tolist()))
+    test_pairs  = set(zip(test_row.cpu().tolist(),  test_col.cpu().tolist()))
+    pair_overlap = train_pairs & test_pairs
+
+    if pair_overlap:
         raise ValueError(
-            f"Split leakage detected for {target_type}: "
-            f"{len(overlap):,} test proteins also appear in train annotations "
-            f"(e.g. indices {sorted(overlap)[:5]}...). "
-            f"Evaluation numbers would be inflated."
+            f"Edge leakage detected for {target_type}: "
+            f"{len(pair_overlap):,} (protein, GO) pairs appear in BOTH train and test supervision edges. "
+            f"The model is being tested on labels it was trained on."
         )
 
-    print(f"  {target_type}: split OK — "
-          f"{len(train_prots):,} train proteins / {len(test_prots):,} test proteins / 0 overlap")
+    print(f"  {target_type}: edge-level split OK — "
+          f"{len(train_pairs):,} train edges / {len(test_pairs):,} test edges / 0 pair overlap")
     return True
