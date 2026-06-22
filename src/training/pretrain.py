@@ -11,8 +11,9 @@ from src.utils.schedulers import WarmupCosineScheduler
 from src.utils.logger import TrainingLogger
 
 # InfoNCE batch: [S x S] similarity matrix = S^2 float32 entries.
-# At S=4096: 67 MB on-GPU, safe alongside the encoder activation graph on T4.
-_MAX_PAIRS_EPOCH = 4_096
+# At S=4096: 67 MB on-GPU — too large on T4 once the 3-layer CompGCN forward
+# is also live.  Default 1024 (4 MB sim matrix); configurable via pretrain.infonce_batch.
+_MAX_PAIRS_EPOCH = 1_024
 
 
 def pretrain(
@@ -115,23 +116,34 @@ def pretrain(
     from src.training.adversarial import _get_has_function_rel_idx
     rel_idx = _get_has_function_rel_idx(encoder)
 
+    infonce_batch = pt_cfg.get("infonce_batch", _MAX_PAIRS_EPOCH)
+
     use_oc = (direct_parents is not None)
     oc_str = f"  {oc_weight}*OrderConsistency" if use_oc else ""
     print(f"Starting pre-training: {epochs} epochs, {n_pairs:,} positive pairs")
-    print(f"  InfoNCE batch={min(n_pairs, _MAX_PAIRS_EPOCH):,}  temp={temperature}  dm_neg={num_neg}")
+    print(f"  InfoNCE batch={min(n_pairs, infonce_batch):,}  temp={temperature}  dm_neg={num_neg}")
     print(f"  Loss weights: 1.0*InfoNCE(sym+mask)  0.1*cosine  {dm_weight}*ComplEx-LP{oc_str}")
+
+    # Print node type sizes so users can spot any unexpectedly large node types (e.g. ChEMBL)
+    print("  Node type sizes in graph:")
+    for ntype in train_data.node_types:
+        if hasattr(train_data[ntype], "x") and train_data[ntype].x is not None:
+            print(f"    {ntype}: {train_data[ntype].x.shape[0]:,} nodes")
+        elif hasattr(train_data[ntype], "num_nodes"):
+            print(f"    {ntype}: {train_data[ntype].num_nodes:,} nodes (no features)")
 
     global_step = 0
     half = encoder.output_dim // 2  # ComplEx splits dim into real / imaginary halves
 
     for epoch in range(1, epochs + 1):
+        torch.cuda.empty_cache()   # flush fragmented cache before each encoder forward
         scheduler.step(epoch - 1)
         optimizer.zero_grad()
 
         protein_embs, go_embs, rel_embs = encoder(train_data)
         rel_vec = rel_embs[rel_idx]   # [D]
 
-        sample_sz = min(n_pairs, _MAX_PAIRS_EPOCH)
+        sample_sz = min(n_pairs, infonce_batch)
         perm      = torch.randperm(n_pairs, device=device)[:sample_sz]
         b_prot    = protein_indices[perm]
         b_go      = go_indices[perm]

@@ -52,6 +52,10 @@ pretrain:
   # InfoNCE uses all S-1 in-batch GO terms as negatives automatically.
   num_negatives: 32
   infonce_temperature: 0.07       # SimCLR default; lower = sharper separation
+  # infonce_batch: proteins sampled per epoch for InfoNCE [S,S] matrix.
+  # Memory scales as S^2.  1024 = 4 MB sim matrix; safe on T4 with 3-layer CompGCN.
+  # Reduce further (512) if OOM persists.
+  infonce_batch: 1024
   distmult_weight: 0.5            # weight on the ComplEx LP loss
   # order_consistency_weight: hinge penalty when ComplEx scores parent GO lower than child.
   # Requires passing direct_parents=build_direct_parents(train_data) to pretrain().

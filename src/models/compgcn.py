@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint as _ck
 from torch_geometric.data import HeteroData
 
-_EDGE_CHUNK = 50_000
+_EDGE_CHUNK = 5_000   # T4 has 14.6 GB; 50k chunks created ~250 MB FFT temp per chunk
 
 
 def ccorr(a: Tensor, b: Tensor) -> Tensor:
@@ -61,10 +61,12 @@ class CompGCNLayer(nn.Module):
                 fa       = torch.fft.rfft(e_src, dim=-1)                 # [chunk, D/2+1]
                 composed = torch.fft.irfft(fa.conj() * fb_single,
                                            n=self.in_dim, dim=-1)        # [chunk, D]
+                del e_src, fa   # free FFT intermediates before linear layers
 
                 # Keep everything float32 to avoid scatter dtype mismatches
                 msg_out = self.W_O(composed)   # [chunk, out_dim] float32
                 msg_in  = self.W_I(composed)   # [chunk, out_dim] float32
+                del composed   # free before scatter
 
                 if dst_type not in agg:
                     agg[dst_type] = torch.zeros(
@@ -77,6 +79,7 @@ class CompGCNLayer(nn.Module):
                     0, dst_idx.unsqueeze(1).expand(-1, self.out_dim), msg_out)
                 agg[src_type].scatter_add_(
                     0, src_idx.unsqueeze(1).expand(-1, self.out_dim), msg_in)
+                del msg_out, msg_in, src_idx, dst_idx   # free before next chunk
 
         new_node_embs: Dict[str, Tensor] = {}
         for ntype, h in node_embs.items():
