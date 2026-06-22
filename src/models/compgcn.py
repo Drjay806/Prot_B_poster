@@ -262,8 +262,19 @@ class CompGCN(nn.Module):
         ntypes     = list(node_embs.keys())
 
         edge_types_indexed, edge_indices = self._build_edge_info(data)
-        num_nodes = {ntype: data[ntype].num_nodes for ntype in self._relevant_types
-                     if ntype in self.node_types}
+        # Use x.shape[0] when available — ProtHGT data sets _num_nodes to the raw
+        # UniProt database size (~13.7M) while x only covers the 261k featured proteins.
+        # data[ntype].num_nodes returns _num_nodes (explicit metadata wins over x.shape[0]
+        # in PyG), so using it here causes agg["Protein"] = zeros(13.7M, 256) = 14 GB.
+        num_nodes = {}
+        for _nt in self._relevant_types:
+            if _nt not in self.node_types:
+                continue
+            _store = data[_nt]
+            if hasattr(_store, 'x') and _store.x is not None:
+                num_nodes[_nt] = _store.x.shape[0]
+            else:
+                num_nodes[_nt] = _store.num_nodes
 
         for layer, skip_proj, res_norm in zip(self.layers, self.skip_projs, self.residual_norms):
             if self.training:
