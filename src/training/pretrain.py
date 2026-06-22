@@ -124,13 +124,18 @@ def pretrain(
     print(f"  InfoNCE batch={min(n_pairs, infonce_batch):,}  temp={temperature}  dm_neg={num_neg}")
     print(f"  Loss weights: 1.0*InfoNCE(sym+mask)  0.1*cosine  {dm_weight}*ComplEx-LP{oc_str}")
 
-    # Print node type sizes so users can spot any unexpectedly large node types (e.g. ChEMBL)
-    print("  Node type sizes in graph:")
-    for ntype in train_data.node_types:
+    # Print which node types the model actually projects (after whitelist filter)
+    print("  Node types the encoder projects (gnn_edge_types whitelist applied):")
+    for ntype, proj in encoder.input_projs.items():
         if hasattr(train_data[ntype], "x") and train_data[ntype].x is not None:
-            print(f"    {ntype}: {train_data[ntype].x.shape[0]:,} nodes")
-        elif hasattr(train_data[ntype], "num_nodes"):
-            print(f"    {ntype}: {train_data[ntype].num_nodes:,} nodes (no features)")
+            raw_dim = train_data[ntype].x.shape
+            raw_mb  = raw_dim[0] * raw_dim[1] * 4 / 1e6
+            print(f"    {ntype}: {raw_dim[0]:,} nodes × {raw_dim[1]}d raw = {raw_mb:.0f} MB")
+        else:
+            print(f"    {ntype}: embedding (no raw features)")
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1e9
+        print(f"  GPU allocated before training loop: {alloc:.2f} GB")
 
     global_step = 0
     half = encoder.output_dim // 2  # ComplEx splits dim into real / imaginary halves
