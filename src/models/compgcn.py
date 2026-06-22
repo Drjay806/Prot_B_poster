@@ -187,18 +187,18 @@ class CompGCN(nn.Module):
                 idx = torch.arange(data[ntype].num_nodes, device=device)
                 node_embs[ntype] = proj(idx)
             else:
-                x_cpu = data[ntype].x   # stays on CPU — never permanently moved to GPU
-                if self.training:
-                    # Gradient-checkpoint the projection so the raw feature tensor (e.g.
-                    # 261k×1280 = 1.31 GB for Protein) is saved on CPU, not GPU.
-                    # Without this, autograd holds a GPU copy alive for the weight gradient
-                    # of the Linear layer, filling the T4 before any GCN chunk can run.
-                    # During backward, _ck recomputes proj(x_cpu.to(device)) briefly.
-                    _p, _d = proj, device
-                    node_embs[ntype] = _ck(lambda xc, p=_p, d=_d: p(xc.to(d)),
-                                           x_cpu, use_reentrant=False)
-                else:
-                    node_embs[ntype] = proj(x_cpu.to(device))
+                # Run projection without grad.  Avoids holding 261k×1280 raw features
+                # (1.3 GB) in the autograd graph — nested _ck calls cause the checkpoint
+                # engine to save the full graph context for every nesting level, which
+                # OOMs on T4 before a single GCN chunk can run.
+                # GCN weights (W_O / W_I / W_S) receive full gradients via message
+                # passing; only the input-projection Linear weights are frozen here.
+                with torch.no_grad():
+                    x = data[ntype].x.to(device)
+                    emb = proj(x)
+                    del x
+                node_embs[ntype] = emb
+        torch.cuda.empty_cache()   # release freed raw-feature blocks before GCN forward
         return node_embs
 
     def _build_edge_info(self, data: HeteroData):
