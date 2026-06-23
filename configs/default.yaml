@@ -61,8 +61,8 @@ reward:
   ancestor_sim_k: 8
 
 pretrain:
-  epochs: 50
-  lr: 1.0e-3
+  epochs: 150
+  lr: 5.0e-4
   weight_decay: 1.0e-4
   # num_negatives is only for the ComplEx link-prediction auxiliary loss.
   # InfoNCE uses all S-1 in-batch GO terms as negatives automatically.
