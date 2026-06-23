@@ -7,8 +7,8 @@ data:
 encoder:
   input_dim_protein: 1280
   input_dim_go: 200
-  hidden_dim: 128
-  output_dim: 128
+  hidden_dim: 256
+  output_dim: 256
   num_layers: 2             # T4 14.6 GB: gradient checkpoint stores N_layers sets of
                             # full node_embs (all types × nodes × 256). 3 layers fills
                             # GPU before any chunk runs. 2 layers is the safe ceiling.
@@ -37,21 +37,21 @@ encoder:
     - protein_ec
 
 generator:
-  protein_dim: 128
-  relation_dim: 128
+  protein_dim: 256
+  relation_dim: 256
   noise_dim: 64
-  hidden_dims: [256, 256, 128]
-  output_dim: 128
+  hidden_dims: [512, 512, 256]
+  output_dim: 256
   negative_slope: 0.2
 
 discriminator:
-  input_dim: 256
-  hidden_dims: [256, 128]
+  input_dim: 512
+  hidden_dims: [512, 256]
   output_dim: 1
   negative_slope: 0.2
 
 distmult:
-  hidden_dim: 128
+  hidden_dim: 256
 
 reward:
   lambda_hier: 0.5
