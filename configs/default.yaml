@@ -21,25 +21,20 @@ encoder:
   # simultaneously for every layer.  Whitelist keeps only protein-function-relevant edges
   # (Protein↔GO, GO hierarchy, PPI, domain, pathway, orthology) — excludes large-DB types.
   # To re-enable all types, set gnn_edge_types: []  (needs >20 GB GPU).
+  # Rev_* edges removed: CompGCNLayer already updates both src and dst nodes for
+  # every directed edge (W_O to dst, W_I back to src), so explicit reverse edges
+  # double the edge count and GPU accumulation without adding new information flow.
+  # Forward-only edges: ~2.9M vs ~5.8M total, keeping peak GPU well under 14.6 GB.
   gnn_edge_types:
     - protein_function
-    - rev_protein_function
     - function_function
-    - rev_function_function
     - PPI
-    - rev_PPI
     - protein_domain
-    - rev_protein_domain
     - domain_function
-    - rev_domain_function
     - Pathway
-    - rev_Pathway
     - kegg_path_prot
-    - rev_kegg_path_prot
     - Orthology
-    - rev_Orthology
     - protein_ec
-    - rev_protein_ec
 
 generator:
   protein_dim: 128
