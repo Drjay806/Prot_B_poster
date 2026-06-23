@@ -41,11 +41,6 @@ class CompGCNLayer(nn.Module):
         device = next(iter(node_embs.values())).device
         agg: Dict[str, Tensor] = {}
 
-        _d = lambda: torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-        print(f"[MEM] CompGCNLayer.forward entry: {_d():.3f} GB")
-        print(f"[MEM]   node_embs: {[(k, tuple(v.shape), f'{v.numel()*4/1e6:.0f}MB') for k,v in node_embs.items()]}")
-        print(f"[MEM]   num_nodes: {num_nodes}")
-
         for (src_type, rel_idx, dst_type), edge_index in zip(edge_types, edge_indices):
             n_edges = edge_index.size(1)
             if n_edges == 0:
@@ -56,8 +51,6 @@ class CompGCNLayer(nn.Module):
             e_rel     = rel_embs[rel_idx].float()
             fb_single = torch.fft.rfft(e_rel.unsqueeze(0), dim=-1)   # [1, D/2+1]
 
-            print(f"[MEM]   rel ({src_type}→{dst_type}) n_edges={n_edges}: {_d():.3f} GB after fb_single")
-
             for chunk_s in range(0, n_edges, _EDGE_CHUNK):
                 chunk_e = min(chunk_s + _EDGE_CHUNK, n_edges)
                 # Edge indices may be CPU tensors (graph kept on CPU); move to device
@@ -66,7 +59,6 @@ class CompGCNLayer(nn.Module):
 
                 e_src    = node_embs[src_type][src_idx].float()          # [chunk, D]
                 fa       = torch.fft.rfft(e_src, dim=-1)                 # [chunk, D/2+1]
-                print(f"[MEM]     chunk {chunk_s}-{chunk_e}: after rfft={_d():.3f} GB  e_src={tuple(e_src.shape)} fa={tuple(fa.shape)}")
                 composed = torch.fft.irfft(fa.conj() * fb_single,
                                            n=self.in_dim, dim=-1)        # [chunk, D]
                 del e_src, fa   # free FFT intermediates before linear layers
@@ -238,11 +230,8 @@ class CompGCN(nn.Module):
                         edge_types_indexed, edge_indices, num_nodes):
         """Gradient-checkpointed version: stores only layer inputs, recomputes on backward."""
         node_embs_list = [node_embs[nt] for nt in ntypes]
-        _d = lambda: torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-        print(f"[MEM] _apply_layer_ck before _ck: {_d():.3f} GB  (node_embs_list total={sum(t.numel()*4 for t in node_embs_list)/1e6:.0f} MB)")
 
         def _fn(rel_in, *ne_in):
-            print(f"[MEM] inside _fn (checkpoint body): {_d():.3f} GB")
             ne = dict(zip(ntypes, ne_in))
             new_ne, new_rel = layer(ne, rel_in,
                                     edge_types_indexed, edge_indices, num_nodes)
@@ -267,16 +256,12 @@ class CompGCN(nn.Module):
 
     def forward(self, data: HeteroData,
                 target_type: Optional[str] = None) -> Tuple[Tensor, Tensor, Tensor]:
-        _d = lambda: torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-        print(f"[MEM] CompGCN.forward entry: {_d():.3f} GB")
         ttype      = target_type or self.target_type
         node_embs  = self._get_input_embeddings(data)
-        print(f"[MEM] after _get_input_embeddings: {_d():.3f} GB")
         rel_embs   = self.rel_emb.weight.float()
         ntypes     = list(node_embs.keys())
 
         edge_types_indexed, edge_indices = self._build_edge_info(data)
-        print(f"[MEM] after _build_edge_info: {_d():.3f} GB  ({len(edge_types_indexed)} edge type groups)")
         # Use x.shape[0] when available — ProtHGT data sets _num_nodes to the raw
         # UniProt database size (~13.7M) while x only covers the 261k featured proteins.
         # data[ntype].num_nodes returns _num_nodes (explicit metadata wins over x.shape[0]
@@ -292,7 +277,6 @@ class CompGCN(nn.Module):
                 num_nodes[_nt] = _store.num_nodes
 
         for _li, (layer, skip_proj, res_norm) in enumerate(zip(self.layers, self.skip_projs, self.residual_norms)):
-            print(f"[MEM] before layer {_li}: {_d():.3f} GB")
             if self.training:
                 node_embs, rel_embs = self._apply_layer_ck(
                     layer, skip_proj, res_norm,
