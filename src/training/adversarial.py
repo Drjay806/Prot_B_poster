@@ -99,13 +99,14 @@ def train_adversarial(
         row_s_cpu      = row_s.cpu()
 
         epoch_metrics: Dict[str, list] = {k: [] for k in [
-            "loss/critic", "loss/gen", "loss/anchor",
+            "loss/critic", "loss/gen", "loss/anchor", "loss/encoder",
             "reward/distmult_mean",
             "scores/real", "scores/fake", "scores/hard",
             "disc/real_acc", "disc/ranking_acc",
         ]}
 
-        # Encoder called ONCE per epoch — frozen during adversarial phase.
+        # Encoder forward ONCE per epoch for batch-level embeddings (no grad for speed).
+        # A separate grad-enabled forward at epoch end updates encoder weights via opt_enc.
         encoder.eval()
         with torch.no_grad():
             protein_embs, go_embs, rel_embs = encoder(train_data)
@@ -215,6 +216,26 @@ def train_adversarial(
                 logger.log(step_metrics, step=global_step, phase="adversarial")
                 logger.check_health(global_step)
 
+        # ── Encoder update: once per epoch with grad enabled ─────────────────────
+        # Runs a full CompGCN forward WITH gradients (gradient checkpointing keeps
+        # memory safe — same mechanism used in Phase 1 pretrain).
+        # Loss: (1) adversarial — push real pair embeddings to score higher with critic
+        #        (2) ComplEx anchor — preserve Phase 1 link-prediction quality
+        opt_enc.zero_grad()
+        p_emb_g, go_emb_g, r_emb_g = encoder(train_data)
+        rv_g       = r_emb_g[rel_idx]
+        enc_sample = min(batch_size, len(row))
+        enc_perm   = torch.randperm(len(row), device=device)[:enc_sample]
+        ep = p_emb_g[row[enc_perm]]    # [B, D]  protein embeddings with grad
+        eg = go_emb_g[col[enc_perm]]   # [B, D]  GO embeddings with grad
+        adv_enc  = -discriminator.score(ep, eg).mean()
+        dm_enc   = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
+        loss_enc = 0.5 * adv_enc + 0.5 * dm_enc
+        loss_enc.backward()
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), grad_clip)
+        opt_enc.step()
+        epoch_metrics["loss/encoder"].append(loss_enc.item())
+
         # Epoch-level averages
         avg = {k: sum(v) / max(len(v), 1) for k, v in epoch_metrics.items()}
 
@@ -234,7 +255,7 @@ def train_adversarial(
             print(
                 f"[Adv {epoch}/{epochs}] "
                 f"W_dist={w_dist_approx:.3f}  C_loss={avg['loss/critic']:.3f}  G_loss={avg['loss/gen']:.3f}  "
-                f"anchor={avg['loss/anchor']:.3f}  "
+                f"E_loss={avg['loss/encoder']:.3f}  anchor={avg['loss/anchor']:.3f}  "
                 f"scores(real={avg['scores/real']:.2f} fake={avg['scores/fake']:.2f} hard={avg['scores/hard']:.2f})  "
                 f"DistMult={avg['reward/distmult_mean']:.3f}  "
                 f"acc(real={avg['disc/real_acc']*100:.0f}% rank={avg['disc/ranking_acc']*100:.0f}%)"
