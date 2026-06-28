@@ -216,25 +216,29 @@ def train_adversarial(
                 logger.log(step_metrics, step=global_step, phase="adversarial")
                 logger.check_health(global_step)
 
-        # ── Encoder update: once per epoch with grad enabled ─────────────────────
-        # Runs a full CompGCN forward WITH gradients (gradient checkpointing keeps
-        # memory safe — same mechanism used in Phase 1 pretrain).
-        # Loss: (1) adversarial — push real pair embeddings to score higher with critic
-        #        (2) ComplEx anchor — preserve Phase 1 link-prediction quality
-        opt_enc.zero_grad()
-        p_emb_g, go_emb_g, r_emb_g = encoder(train_data)
-        rv_g       = r_emb_g[rel_idx]
-        enc_sample = min(batch_size, len(row))
-        enc_perm   = torch.randperm(len(row), device=device)[:enc_sample]
-        ep = p_emb_g[row[enc_perm]]    # [B, D]  protein embeddings with grad
-        eg = go_emb_g[col[enc_perm]]   # [B, D]  GO embeddings with grad
-        adv_enc  = -discriminator.score(ep, eg).mean()
-        dm_enc   = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
-        loss_enc = 0.5 * adv_enc + 0.5 * dm_enc
-        loss_enc.backward()
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), grad_clip)
-        opt_enc.step()
-        epoch_metrics["loss/encoder"].append(loss_enc.item())
+        # ── Encoder update: only after discriminator has stabilised ──────────────
+        # The critic provides meaningful gradients only once it can reliably
+        # separate real from fake (rank_acc > ~75%, typically epoch 20+).
+        # Updating the encoder against an untrained critic adds pure noise and
+        # causes catastrophic forgetting of Phase 1 representations.
+        _ENC_WARMUP = 20   # epochs to let critic stabilise before touching encoder
+        if epoch >= _ENC_WARMUP:
+            opt_enc.zero_grad()
+            p_emb_g, go_emb_g, r_emb_g = encoder(train_data)
+            rv_g       = r_emb_g[rel_idx]
+            enc_sample = min(batch_size, len(row))
+            enc_perm   = torch.randperm(len(row), device=device)[:enc_sample]
+            ep = p_emb_g[row[enc_perm]]    # [B, D]
+            eg = go_emb_g[col[enc_perm]]   # [B, D]
+            adv_enc  = -discriminator.score(ep, eg).mean()
+            dm_enc   = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
+            loss_enc = 0.5 * adv_enc + 0.5 * dm_enc
+            loss_enc.backward()
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), grad_clip)
+            opt_enc.step()
+            epoch_metrics["loss/encoder"].append(loss_enc.item())
+        else:
+            epoch_metrics["loss/encoder"].append(0.0)
 
         # Epoch-level averages
         avg = {k: sum(v) / max(len(v), 1) for k, v in epoch_metrics.items()}
