@@ -260,6 +260,9 @@ def evaluate_all(
     macro_f1 = float(np.mean(per_go)) if per_go else 0.0
     mcc_val  = float(matthews_corrcoef(true_bin_auc.ravel(), pred_bin_auc.ravel()))
 
+    print("Computing Hit@k / MRR (filtered ranking, KGC protocol) ...")
+    rank_metrics = compute_ranking_metrics(auc_scores, auc_true)
+
     results = {
         "fmax":           best_f1,
         "smin":           smin_val,
@@ -270,6 +273,7 @@ def evaluate_all(
         "macro_f1":       macro_f1,
         "mcc":            mcc_val,
         "mode":           mode,
+        **rank_metrics,
     }
     _print_results(results, baseline_fmax, target_type)
     return results
@@ -430,6 +434,47 @@ def tune_ensemble_alpha(
     return best_alpha
 
 
+def compute_ranking_metrics(
+    scores:    torch.Tensor,           # [N_p, N_go] CPU
+    true_mat:  torch.Tensor,           # [N_p, N_go] CPU, 0/1
+    k_values:  Tuple[int, ...] = (1, 3, 10),
+) -> Dict[str, float]:
+    """
+    Filtered Hit@k and MRR — standard knowledge-graph-completion protocol
+    (Bordes et al. 2013).  For each protein's true GO terms, rank against all
+    GO terms with the protein's OTHER true positives removed from the
+    candidate pool, so a protein's own correct multi-label annotations don't
+    suppress each other's rank.
+
+    This is a different lens than Fmax: Fmax is the CAFA protein-function
+    metric (hierarchy-aware, threshold-based F1). Hit@k/MRR are the metrics
+    used to evaluate ComplEx/DistMult/TransE-style link predictors on
+    standard KGC benchmarks (FB15k-237, WN18RR). Reporting both makes clear
+    which literature each number should be compared against.
+    """
+    n_p = scores.size(0)
+    rank_chunks = []
+    for i in range(n_p):
+        true_mask = true_mat[i] > 0.5
+        n_true = int(true_mask.sum().item())
+        if n_true == 0:
+            continue
+        true_scores  = scores[i][true_mask]     # [n_true]
+        false_scores = scores[i][~true_mask]    # [N_go - n_true]
+        ranks = (false_scores.unsqueeze(0) > true_scores.unsqueeze(1)).sum(dim=1) + 1
+        rank_chunks.append(ranks)
+
+    if not rank_chunks:
+        out = {f"hit@{k}": 0.0 for k in k_values}
+        out["mrr"] = 0.0
+        return out
+
+    ranks = torch.cat(rank_chunks).float()
+    out = {f"hit@{k}": (ranks <= k).float().mean().item() for k in k_values}
+    out["mrr"] = (1.0 / ranks).mean().item()
+    return out
+
+
 def critic_score_all(
     discriminator,
     protein_embs: torch.Tensor,   # [N_p, D]
@@ -491,8 +536,8 @@ def print_ablation_table(
             all_onts.update(cond.keys())
         ontologies = sorted(all_onts)
 
-    metrics = ["fmax", "smin", "aupr", "micro_f1", "mcc"]
-    header_metrics = ["Fmax↑", "Smin↓", "AUPR↑", "F1↑", "MCC↑"]
+    metrics = ["fmax", "smin", "aupr", "micro_f1", "mcc", "hit@10", "mrr"]
+    header_metrics = ["Fmax↑", "Smin↓", "AUPR↑", "F1↑", "MCC↑", "Hit@10↑", "MRR↑"]
 
     for ont in ontologies:
         print(f"\n## {ont.upper()}")
@@ -600,4 +645,10 @@ def _print_results(
     print(f"  Macro-F1: {results['macro_f1']:.4f}")
     print(f"  MCC:      {results['mcc']:.4f}")
     print(f"  Threshold:{results['best_threshold']:.4f}")
+    if "mrr" in results:
+        print(f"  -- KGC ranking metrics (filtered protocol) --")
+        print(f"  Hit@1:    {results.get('hit@1', float('nan')):.4f}")
+        print(f"  Hit@3:    {results.get('hit@3', float('nan')):.4f}")
+        print(f"  Hit@10:   {results.get('hit@10', float('nan')):.4f}")
+        print(f"  MRR:      {results['mrr']:.4f}")
     print(f"{'='*60}\n")

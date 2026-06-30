@@ -99,3 +99,53 @@ class DistMult(nn.Module):
             chunk = protein_emb[start:start + chunk_size]
             parts.append(self.score_all(chunk, relation_emb, go_embs).cpu())
         return torch.cat(parts, dim=0)
+
+
+class TrueDistMult(nn.Module):
+    """
+    Classic DistMult scorer (Yang et al. 2015): score(p, r, g) = sum_k p_k * r_k * g_k.
+
+    Symmetric — score(p, r, g) == score(g, r, p) — and cannot represent the
+    asymmetric, many-to-many protein->GO relation as well as ComplEx (see the
+    `DistMult` class above, which actually implements ComplEx scoring).
+
+    Included only as a shallow knowledge-graph-completion baseline for the
+    comparison chart: how much does ComplEx's extra expressiveness, and the
+    CompGCN's graph structure, actually buy over the simplest possible scorer.
+    """
+
+    def __init__(self, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+    def forward(
+        self,
+        protein_emb:  torch.Tensor,   # [..., D]
+        relation_emb: torch.Tensor,   # [..., D] or [D] (broadcast)
+        go_emb:       torch.Tensor,   # [..., D]
+    ) -> torch.Tensor:
+        return (protein_emb * relation_emb * go_emb).sum(dim=-1)
+
+    def score_all(
+        self,
+        protein_emb:  torch.Tensor,   # [N_p, D]
+        relation_emb: torch.Tensor,   # [D]
+        go_embs:      torch.Tensor,   # [N_g, D]
+    ) -> torch.Tensor:
+        """Score every (protein, relation, GO_term) combination. Returns [N_p, N_g]."""
+        pr = protein_emb * relation_emb.unsqueeze(0)   # [N_p, D]
+        return pr @ go_embs.t()                         # [N_p, N_g]
+
+    def score_all_chunked(
+        self,
+        protein_emb:  torch.Tensor,
+        relation_emb: torch.Tensor,
+        go_embs:      torch.Tensor,
+        chunk_size:   int = 1000,
+    ) -> torch.Tensor:
+        """Memory-safe chunked version of score_all. Returns [N_p, N_g]."""
+        parts = []
+        for start in range(0, protein_emb.size(0), chunk_size):
+            chunk = protein_emb[start:start + chunk_size]
+            parts.append(self.score_all(chunk, relation_emb, go_embs).cpu())
+        return torch.cat(parts, dim=0)
