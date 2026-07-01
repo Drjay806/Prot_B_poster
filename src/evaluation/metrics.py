@@ -170,7 +170,7 @@ def evaluate_all(
         with torch.no_grad():
             critic_chunk = (
                 critic_scores_full[prot_start:prot_end].to(device)
-                if mode in ("critic", "ensemble") else None
+                if mode in ("critic", "ensemble", "calibration") else None
             )
             chunk_scores = _build_chunk_scores(
                 protein_embs[prot_start:prot_end], go_embs, rel_vec, g_norm,
