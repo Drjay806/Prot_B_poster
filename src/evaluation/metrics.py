@@ -58,6 +58,7 @@ def evaluate_all(
     ensemble_alpha: float = 0.7,
     ic_vec:        Optional[torch.Tensor] = None,
     discriminator  = None,
+    calibration_head = None,
 ) -> Dict[str, float]:
     """
     Full evaluation on a single ontology.
@@ -86,6 +87,8 @@ def evaluate_all(
 
     if mode in ("critic", "ensemble") and discriminator is None:
         raise ValueError(f"mode='{mode}' requires discriminator to be passed")
+    if mode == "calibration" and calibration_head is None:
+        raise ValueError("mode='calibration' requires calibration_head to be passed")
 
     encoder.eval()
     if generator is not None:
@@ -109,12 +112,17 @@ def evaluate_all(
         print("Loading propagation edges ...")
         prop_edges = build_propagation_edges(data, target_type)
 
-    # ── Precompute critic scores [N_p, N_go] if needed ────────────────────────
+    # ── Precompute critic/calibration scores [N_p, N_go] if needed ───────────
     if mode in ("critic", "ensemble"):
         print(f"Computing critic scores for {n_p:,} proteins × {n_go:,} GO terms ...")
         critic_scores_full = critic_score_all(
             discriminator, protein_embs, go_embs, device, p_chunk, g_chunk
         )  # [N_p, N_go] CPU
+    elif mode == "calibration":
+        print(f"Computing calibration scores for {n_p:,} proteins × {n_go:,} GO terms ...")
+        critic_scores_full = critic_score_all(
+            calibration_head, protein_embs, go_embs, device, p_chunk, g_chunk
+        )  # [N_p, N_go] CPU — reuses same chunked infrastructure
 
     # ── Precompute generator embeddings [N_p, D] if gen_weight > 0 ────────────
     gen_p_norm = None
@@ -230,7 +238,7 @@ def evaluate_all(
     with torch.no_grad():
         critic_auc = (
             critic_scores_full[sel].to(device)
-            if mode in ("critic", "ensemble") else None
+            if mode in ("critic", "ensemble", "calibration") else None
         )
         auc_scores = _build_chunk_scores(
             protein_embs[sel.to(device)], go_embs, rel_vec, g_norm,
@@ -588,8 +596,8 @@ def _build_chunk_scores(
             return (1.0 - gen_weight) * enc_scores + gen_weight * gen_scores
         return enc_scores
 
-    elif mode == "critic":
-        # critic_chunk is already [C, N_go] precomputed
+    elif mode in ("critic", "calibration"):
+        # precomputed [C, N_go] — same path for critic and calibration head
         return critic_chunk.cpu() if critic_chunk.device.type != "cpu" else critic_chunk
 
     elif mode == "ensemble":
