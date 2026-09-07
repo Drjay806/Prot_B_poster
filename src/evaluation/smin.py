@@ -155,7 +155,7 @@ class SminAccumulator:
     Streaming Smin accumulator for chunked score matrices.
 
     Usage:
-        acc = SminAccumulator(ic_vec, t_steps=100, score_min=s_min, score_max=s_max)
+        acc = SminAccumulator(ic_vec, thresholds=thresholds)
         for prot_chunk_scores, prot_chunk_true in chunks:
             acc.update(prot_chunk_scores, prot_chunk_true)
         smin_val, best_t = acc.finalize()
@@ -163,21 +163,13 @@ class SminAccumulator:
 
     def __init__(
         self,
-        ic_vec:    torch.Tensor,   # [N_go] on CPU
-        t_steps:   int,
-        score_min: float,
-        score_max: float,
+        ic_vec:     torch.Tensor,      # [N_go] on CPU
+        thresholds: List[float],
     ):
-        self.ic_vec    = ic_vec
-        self.t_steps   = t_steps
-        self.score_min = score_min
-        self.score_max = score_max
-        self.thresholds = [
-            score_min + i * (score_max - score_min) / t_steps
-            for i in range(t_steps + 1)
-        ]
+        self.ic_vec     = ic_vec
+        self.thresholds = list(thresholds)
         # sum_s[t_idx] = sum of S(i, τ) over all proteins
-        self.sum_s   = np.zeros(t_steps + 1, dtype=np.float64)
+        self.sum_s   = np.zeros(len(self.thresholds), dtype=np.float64)
         self.n_valid = 0   # proteins with ≥1 annotation
 
     def update(

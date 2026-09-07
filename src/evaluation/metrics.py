@@ -170,15 +170,28 @@ def evaluate_all(
     score_max = float(probe.max())
     del probe
 
-    print(f"Computing Fmax+Smin [{mode}] streaming {n_p:,} proteins ...")
-    print(f"  Score range: [{score_min:.3f}, {score_max:.3f}]")
+    # Base linear grid across the full range, PLUS extra fine-grained candidates in the
+    # top 10% of the range. Verified empirically (calibration mode) that the best-F1
+    # threshold lands at the 2nd-highest of 100 evenly-spaced candidates between 0 and 1 --
+    # i.e. the true optimum is likely just beyond what a 100-step linear grid can resolve.
+    # (Tried quantile-spaced thresholds first -- rejected: for this problem shape, ~97% of
+    # scores are obvious true negatives clustered at the low end, so quantiles spend nearly
+    # all their resolution there and give even FEWER candidates near the top than linear
+    # spacing does -- verified this makes it worse, not better, before ruling it out.)
+    base_thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
+    top_start = score_min + 0.9 * (score_max - score_min)
+    extra_thresholds = [top_start + i * (score_max - top_start) / t_steps for i in range(1, t_steps + 1)]
+    thresholds = sorted(set(base_thresholds + extra_thresholds))
 
-    thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
-    sum_prec = np.zeros(t_steps + 1)
-    sum_rec  = np.zeros(t_steps + 1)
+    print(f"Computing Fmax+Smin [{mode}] streaming {n_p:,} proteins ...")
+    print(f"  Score range: [{score_min:.3f}, {score_max:.3f}]  "
+          f"({len(thresholds)} threshold candidates, extra resolution in top 10%)")
+
+    sum_prec = np.zeros(len(thresholds))
+    sum_rec  = np.zeros(len(thresholds))
     n_counted = 0
 
-    smin_acc = SminAccumulator(ic_vec, t_steps, score_min, score_max) if ic_vec is not None else None
+    smin_acc = SminAccumulator(ic_vec, thresholds) if ic_vec is not None else None
 
     for prot_start in range(0, n_p, chunk_size):
         prot_end  = min(prot_start + chunk_size, n_p)
