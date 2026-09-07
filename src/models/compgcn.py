@@ -17,10 +17,11 @@ def ccorr(a: Tensor, b: Tensor) -> Tensor:
 
 
 class CompGCNLayer(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1, edge_chunk: int = _EDGE_CHUNK):
         super().__init__()
         self.in_dim  = in_dim
         self.out_dim = out_dim
+        self.edge_chunk = edge_chunk
         self.W_O   = nn.Linear(in_dim, out_dim, bias=False)
         self.W_I   = nn.Linear(in_dim, out_dim, bias=False)
         self.W_S   = nn.Linear(in_dim, out_dim, bias=False)
@@ -51,8 +52,8 @@ class CompGCNLayer(nn.Module):
             e_rel     = rel_embs[rel_idx].float()
             fb_single = torch.fft.rfft(e_rel.unsqueeze(0), dim=-1)   # [1, D/2+1]
 
-            for chunk_s in range(0, n_edges, _EDGE_CHUNK):
-                chunk_e = min(chunk_s + _EDGE_CHUNK, n_edges)
+            for chunk_s in range(0, n_edges, self.edge_chunk):
+                chunk_e = min(chunk_s + self.edge_chunk, n_edges)
                 # Edge indices may be CPU tensors (graph kept on CPU); move to device
                 src_idx = edge_index[0, chunk_s:chunk_e].to(device)
                 dst_idx = edge_index[1, chunk_s:chunk_e].to(device)
@@ -152,9 +153,10 @@ class CompGCN(nn.Module):
         self.rel_emb = nn.Embedding(len(rel_names), self.hidden_dim)
         nn.init.xavier_uniform_(self.rel_emb.weight.unsqueeze(0))
 
+        edge_chunk_size = enc_cfg.get("edge_chunk_size", _EDGE_CHUNK)
         dims = [self.hidden_dim] * self.num_layers + [self.output_dim]
         self.layers = nn.ModuleList([
-            CompGCNLayer(dims[i], dims[i + 1], dropout=self.dropout_pretrain)
+            CompGCNLayer(dims[i], dims[i + 1], dropout=self.dropout_pretrain, edge_chunk=edge_chunk_size)
             for i in range(self.num_layers)
         ])
         self.skip_projs = nn.ModuleList([

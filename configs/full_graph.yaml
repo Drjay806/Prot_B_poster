@@ -1,0 +1,119 @@
+# Full-knowledge-graph configuration — requires a Premium GPU runtime (A100, 40GB).
+# In Colab: Runtime > Change runtime type > GPU type > A100 (Colab Pro+ compute units).
+#
+# Differs from default.yaml in exactly two places:
+#   1. gnn_edge_types: []        — disables the memory-budget whitelist. Every edge type
+#                                   (Drug, Disease, Chembl, ... included) is now used for
+#                                   message passing, and every node type gets a GPU-resident
+#                                   input projection. This roughly doubles-to-triples the
+#                                   node types CompGCN.input_projs builds versus default.yaml.
+#   2. encoder.edge_chunk_size   — raised from the T4-safe default of 5,000 to 50,000.
+#                                   On a T4 this created ~250MB of FFT temporaries per chunk
+#                                   (see compgcn.py); on a 40GB A100 that's negligible, so a
+#                                   larger chunk means fewer chunk iterations and faster epochs.
+#
+# Before committing to the full 4-phase pipeline on this config, run ONLY pretrain() for a
+# few epochs first (cheapest phase) and check the printed per-node-type memory estimates in
+# pretrain.py's startup block — that tells you whether the full graph actually fits before
+# you spend compute units on Phases 2-4.
+
+data:
+  drive_root: "/content/drive/MyDrive/Poster code/prothgt/knowledge_graphs/"
+  ontology: "bp"
+  target_type: "GO_term_P"
+  checkpoint_dir: "/content/drive/MyDrive/Poster code/checkpoints_full_graph/"
+
+encoder:
+  input_dim_protein: 1280
+  input_dim_go: 200
+  hidden_dim: 256
+  output_dim: 256
+  num_layers: 2             # keep at 2 for the first full-graph run — a 3rd layer triples
+                            # the gradient-checkpointed embedding sets held per step, on top
+                            # of the extra node types the full graph already adds. Only try
+                            # 3 as a follow-up once a 2-layer run confirms headroom to spare.
+  composition: "ccorr"
+  dropout_pretrain: 0.3
+  dropout_adv: 0.1
+  use_residual: true
+  # Empty whitelist = no filtering = every edge type in the graph is used.
+  gnn_edge_types: []
+  # T4 default is 5,000 (see compgcn.py _EDGE_CHUNK). Raised here because a 40GB A100 has
+  # roughly 2.7x the VRAM and the full graph no longer needs to ration edge-chunk memory
+  # the way default.yaml does.
+  edge_chunk_size: 50000
+
+generator:
+  protein_dim: 256
+  relation_dim: 256
+  noise_dim: 64
+  hidden_dims: [512, 512, 256]
+  output_dim: 256
+  negative_slope: 0.2
+
+discriminator:
+  input_dim: 512
+  hidden_dims: [512, 256]
+  output_dim: 1
+  negative_slope: 0.2
+
+distmult:
+  hidden_dim: 256
+
+reward:
+  lambda_hier: 0.5
+  curriculum_warmup_epochs: 30
+  ancestor_sim_k: 8
+
+pretrain:
+  epochs: 150
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  num_negatives: 32
+  infonce_temperature: 0.07
+  # infonce_batch can likely be raised on an A100 (sim matrix scales as S^2, 4MB at 1024).
+  # Left at the default.yaml value for a fair apples-to-apples comparison on the first run —
+  # raise once you've confirmed the full graph fits at all.
+  infonce_batch: 1024
+  distmult_weight: 0.5
+  order_consistency_weight: 0.3
+  eval_every: 10
+  warmup_epochs: 10
+  log_every_steps: 50
+
+adversarial:
+  epochs: 100
+  batch_size: 256
+  lr_encoder: 1.0e-5
+  lr_generator: 1.0e-4
+  lr_critic: 1.0e-4
+  lr_discriminator: 1.0e-4
+  n_critic: 5
+  lambda_gp: 1.0
+  adam_beta1: 0.0
+  adam_beta2: 0.9
+  grad_clip: 1.0
+  eval_every: 5
+  log_every_steps: 25
+  negative_sampling:
+    hard_neg_temperature: 0.5
+
+rl:
+  epochs: 50
+  batch_size: 128
+  lr_generator: 5.0e-5
+  lr_encoder: 1.0e-5
+  num_samples: 5
+  grad_clip: 1.0
+  eval_every: 3
+  log_every_steps: 10
+
+evaluation:
+  threshold_steps: 100
+  propagate_hierarchy: true
+  score_chunk_size: 1000
+  gen_weight: 0.0
+  mode: "encoder"
+  ensemble_alpha: 0.7
+  protein_chunk_size: 64
+  go_chunk_size: 512
