@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -94,6 +94,32 @@ def build_dense_annotation_matrix(
 
 def get_node_counts(data: HeteroData) -> Dict[str, int]:
     return {ntype: data[ntype].x.shape[0] for ntype in data.node_types if hasattr(data[ntype], "x") and data[ntype].x is not None}
+
+
+def find_leaked_pairs(
+    train_data: HeteroData,
+    test_data:  HeteroData,
+    target_type: str,
+    src_type:   str = "Protein",
+    relation:   str = "protein_function",
+) -> Set[Tuple[int, int]]:
+    """
+    Returns the set of (protein_idx, go_idx) pairs that appear as a positive
+    annotation edge in BOTH train_data and test_data — i.e. exact test triples
+    whose answer was also visible to the encoder during training/message passing.
+
+    This is the direct leakage test: protein-ID overlap across splits does not
+    by itself mean the model was trained on the answer, but an overlapping
+    (protein, GO) PAIR does. Pass the result to evaluate_all(exclude_pairs=...)
+    to score the same test set with these triples removed, and compare Fmax
+    with vs. without them to see whether the measured overlap is actually
+    inflating the reported score.
+    """
+    train_row, train_col, _, _ = build_annotation_matrix(train_data, target_type, src_type, relation)
+    test_row,  test_col,  _, _ = build_annotation_matrix(test_data,  target_type, src_type, relation)
+    train_pairs = set(zip(train_row.cpu().tolist(), train_col.cpu().tolist()))
+    test_pairs  = set(zip(test_row.cpu().tolist(),  test_col.cpu().tolist()))
+    return train_pairs & test_pairs
 
 
 def validate_split_disjointness(

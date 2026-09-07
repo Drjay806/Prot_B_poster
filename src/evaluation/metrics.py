@@ -18,7 +18,7 @@ The same threshold grid and propagation protocol are used for every scoring mode
 and for the ProtHGT comparison row, ensuring apples-to-apples comparison.
 """
 
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +59,7 @@ def evaluate_all(
     ic_vec:        Optional[torch.Tensor] = None,
     discriminator  = None,
     calibration_head = None,
+    exclude_pairs: Optional[Set[Tuple[int, int]]] = None,
 ) -> Dict[str, float]:
     """
     Full evaluation on a single ontology.
@@ -76,6 +77,11 @@ def evaluate_all(
         Compute with: smin.compute_information_content(train_data, target_type, prop_edges)
     discriminator : Discriminator or None
         Required when mode is "critic" or "ensemble".
+    exclude_pairs : set of (protein_idx, go_idx) or None
+        Test triples to drop before scoring — pass the output of
+        graph_builder.find_leaked_pairs(train_data, data, target_type) to get a
+        leakage-free Fmax/Smin, so it can be reported alongside the raw number
+        to show whether measured train/test overlap actually inflates the score.
     """
     eval_cfg   = cfg.get("evaluation", {})
     t_steps    = eval_cfg.get("threshold_steps", 100)
@@ -106,6 +112,17 @@ def evaluate_all(
 
     row, col, n_p, n_go = build_annotation_matrix(data, target_type)
     row_cpu, col_cpu = row.cpu(), col.cpu()
+
+    if exclude_pairs:
+        n_before = len(row_cpu)
+        keep = torch.tensor(
+            [(int(r), int(c)) not in exclude_pairs for r, c in zip(row_cpu.tolist(), col_cpu.tolist())],
+            dtype=torch.bool,
+        )
+        row_cpu, col_cpu = row_cpu[keep], col_cpu[keep]
+        n_dropped = n_before - len(row_cpu)
+        print(f"  Leakage-free mode: dropped {n_dropped:,}/{n_before:,} test triples "
+              f"also seen in training ({len(row_cpu):,} clean triples remain)")
 
     prop_edges: List[Tuple[int, int]] = []
     if propagate:
