@@ -162,7 +162,7 @@ def evaluate_all(
         probe = _build_chunk_scores(
             protein_embs[:probe_end], go_embs, rel_vec, g_norm,
             gen_p_norm[:probe_end] if gen_p_norm is not None else None,
-            critic_scores_full[:probe_end].to(device) if mode in ("critic","ensemble") else None,
+            critic_scores_full[:probe_end].to(device) if mode in ("critic", "ensemble", "calibration") else None,
             distmult, gen_weight, mode, ensemble_alpha, device
         ).cpu()
 
