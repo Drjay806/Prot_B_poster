@@ -1,21 +1,33 @@
-# Full-knowledge-graph configuration — requires a Premium GPU runtime (A100, 40GB).
-# In Colab: Runtime > Change runtime type > GPU type > A100 (Colab Pro+ compute units).
+# Full-knowledge-graph configuration — tuned for an 80GB GPU + 167GB system RAM runtime
+# (confirmed actual specs, not the 40GB originally assumed -- see history below).
 #
-# Differs from default.yaml in exactly two places:
+# Differs from default.yaml in:
 #   1. gnn_edge_types: []        — disables the memory-budget whitelist. Every edge type
 #                                   (Drug, Disease, Chembl, ... included) is now used for
 #                                   message passing, and every node type gets a GPU-resident
 #                                   input projection. This roughly doubles-to-triples the
 #                                   node types CompGCN.input_projs builds versus default.yaml.
-#   2. encoder.edge_chunk_size   — raised from the T4-safe default of 5,000 to 50,000.
-#                                   On a T4 this created ~250MB of FFT temporaries per chunk
-#                                   (see compgcn.py); on a 40GB A100 that's negligible, so a
-#                                   larger chunk means fewer chunk iterations and faster epochs.
+#   2. encoder.edge_chunk_size   — raised to 100,000 (was 5,000 on T4). Bigger chunks =
+#                                   fewer FFT-chunk iterations per layer = faster epochs;
+#                                   trivial memory cost at this GPU size.
+#   3. encoder.num_layers: 3     — a 3rd hop. Was capped at 2 on a T4/40GB assumption
+#                                   (gradient checkpointing holds one full node-embedding
+#                                   set per layer); 80GB has real room for a 3rd. Not pushed
+#                                   further than 3 -- GNNs over-smooth past a few hops
+#                                   regardless of available memory, so more isn't free even
+#                                   when the GPU can hold it.
+#   4. pretrain.infonce_batch: 8192   — was 1024, deliberately matched to default.yaml for a
+#                                   first apples-to-apples memory check. Now that the full
+#                                   graph is confirmed to fit, a bigger contrastive batch
+#                                   gives InfoNCE a larger in-batch negative pool per step --
+#                                   directly targets "embeddings don't have enough signal
+#                                   yet," not just a speed knob.
+#   5. pretrain.num_negatives: 64     — was 32. More ComplEx link-prediction negatives per
+#                                   positive, same rationale as infonce_batch.
 #
-# Before committing to the full 4-phase pipeline on this config, run ONLY pretrain() for a
-# few epochs first (cheapest phase) and check the printed per-node-type memory estimates in
-# pretrain.py's startup block — that tells you whether the full graph actually fits before
-# you spend compute units on Phases 2-4.
+# Run pretrain() for a real number of epochs this time, not the short memory-check pass
+# used to confirm the full graph fits at all -- that earlier pass was a fit test, not a
+# quality result, and shouldn't be read as one.
 
 seed: 42
 
@@ -30,20 +42,18 @@ encoder:
   input_dim_go: 200
   hidden_dim: 256
   output_dim: 256
-  num_layers: 2             # keep at 2 for the first full-graph run — a 3rd layer triples
-                            # the gradient-checkpointed embedding sets held per step, on top
-                            # of the extra node types the full graph already adds. Only try
-                            # 3 as a follow-up once a 2-layer run confirms headroom to spare.
+  num_layers: 3             # raised from 2 now that an 80GB GPU has real headroom for a
+                            # 3rd hop's gradient-checkpointed embedding set. See header note
+                            # on over-smoothing before pushing this further.
   composition: "ccorr"
   dropout_pretrain: 0.3
   dropout_adv: 0.1
   use_residual: true
   # Empty whitelist = no filtering = every edge type in the graph is used.
   gnn_edge_types: []
-  # T4 default is 5,000 (see compgcn.py _EDGE_CHUNK). Raised here because a 40GB A100 has
-  # roughly 2.7x the VRAM and the full graph no longer needs to ration edge-chunk memory
-  # the way default.yaml does.
-  edge_chunk_size: 50000
+  # T4 default is 5,000 (see compgcn.py _EDGE_CHUNK). Raised here for an 80GB GPU, which
+  # no longer needs to ration edge-chunk memory the way default.yaml does.
+  edge_chunk_size: 100000
 
 generator:
   protein_dim: 256
@@ -71,12 +81,13 @@ pretrain:
   epochs: 150
   lr: 5.0e-4
   weight_decay: 1.0e-4
-  num_negatives: 32
+  num_negatives: 64          # raised from 32 -- more ComplEx negatives per positive, more
+                            # signal per step, cheap on an 80GB GPU.
   infonce_temperature: 0.07
-  # infonce_batch can likely be raised on an A100 (sim matrix scales as S^2, 4MB at 1024).
-  # Left at the default.yaml value for a fair apples-to-apples comparison on the first run —
-  # raise once you've confirmed the full graph fits at all.
-  infonce_batch: 1024
+  # Raised from the default.yaml value of 1024 (sim matrix scales as S^2: ~268MB at 8192,
+  # trivial here). A bigger in-batch negative pool is a direct, well-established lever for
+  # stronger contrastive representations (SimCLR-style) -- not just a speed setting.
+  infonce_batch: 8192
   distmult_weight: 0.5
   order_consistency_weight: 0.3
   eval_every: 10
