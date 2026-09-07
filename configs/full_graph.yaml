@@ -17,6 +17,8 @@
 # pretrain.py's startup block — that tells you whether the full graph actually fits before
 # you spend compute units on Phases 2-4.
 
+seed: 42
+
 data:
   drive_root: "/content/drive/MyDrive/Poster code/prothgt/knowledge_graphs/"
   ontology: "bp"

@@ -1,3 +1,5 @@
+seed: 42
+
 data:
   drive_root: "/content/drive/MyDrive/Poster code/prothgt/knowledge_graphs/"
   ontology: "bp"
