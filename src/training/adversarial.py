@@ -99,7 +99,7 @@ def train_adversarial(
         row_s_cpu      = row_s.cpu()
 
         epoch_metrics: Dict[str, list] = {k: [] for k in [
-            "loss/critic", "loss/gen", "loss/anchor", "loss/encoder",
+            "loss/critic", "loss/gen", "loss/anchor", "loss/encoder", "loss/encoder_anchor",
             "reward/distmult_mean",
             "scores/real", "scores/fake", "scores/hard",
             "disc/real_acc", "disc/ranking_acc",
@@ -228,17 +228,28 @@ def train_adversarial(
             rv_g       = r_emb_g[rel_idx]
             enc_sample = min(batch_size, len(row))
             enc_perm   = torch.randperm(len(row), device=device)[:enc_sample]
-            ep = p_emb_g[row[enc_perm]]    # [B, D]
-            eg = go_emb_g[col[enc_perm]]   # [B, D]
-            adv_enc  = -discriminator.score(ep, eg).mean()
-            dm_enc   = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
-            loss_enc = 0.5 * adv_enc + 0.5 * dm_enc
+            ep = p_emb_g[row[enc_perm]]    # [B, D]  -- true protein embeddings
+            eg = go_emb_g[col[enc_perm]]   # [B, D]  -- their TRUE annotated GO embeddings
+            adv_enc = -discriminator.score(ep, eg).mean()
+            dm_enc  = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
+            # Cosine anchor on the encoder's own update, mirroring the generator's anchor
+            # loss above (line ~179). Without this, nothing in Phase 2 keeps the encoder's
+            # TRUE (protein, GO) pairs close together in cosine space once epoch >= 20 --
+            # adv_enc/dm_enc only reward critic-fooling and ComplEx compatibility, so the
+            # cosine-similarity property Phase 1 built (and that _quick_fmax/val_Fmax
+            # measures) can freely decay even while the encoder is genuinely improving by
+            # the other two objectives. This term keeps true pairs anchored while still
+            # letting the encoder move toward the critic/DistMult objectives.
+            anchor_enc = (1.0 - F.cosine_similarity(ep, eg)).mean()
+            loss_enc = 0.5 * adv_enc + 0.5 * dm_enc + 0.2 * anchor_enc
             loss_enc.backward()
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), grad_clip)
             opt_enc.step()
             epoch_metrics["loss/encoder"].append(loss_enc.item())
+            epoch_metrics["loss/encoder_anchor"].append(anchor_enc.item())
         else:
             epoch_metrics["loss/encoder"].append(0.0)
+            epoch_metrics["loss/encoder_anchor"].append(0.0)
 
         # Epoch-level averages
         avg = {k: sum(v) / max(len(v), 1) for k, v in epoch_metrics.items()}
@@ -260,6 +271,7 @@ def train_adversarial(
                 f"[Adv {epoch}/{epochs}] "
                 f"W_dist={w_dist_approx:.3f}  C_loss={avg['loss/critic']:.3f}  G_loss={avg['loss/gen']:.3f}  "
                 f"E_loss={avg['loss/encoder']:.3f}  anchor={avg['loss/anchor']:.3f}  "
+                f"E_anchor={avg['loss/encoder_anchor']:.3f}  "
                 f"scores(real={avg['scores/real']:.2f} fake={avg['scores/fake']:.2f} hard={avg['scores/hard']:.2f})  "
                 f"DistMult={avg['reward/distmult_mean']:.3f}  "
                 f"acc(real={avg['disc/real_acc']*100:.0f}% rank={avg['disc/ranking_acc']*100:.0f}%)"

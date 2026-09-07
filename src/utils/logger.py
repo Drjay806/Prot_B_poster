@@ -79,13 +79,15 @@ class TrainingLogger:
             ra      = metrics.get("disc/real_acc", 0)
             rank_ac = metrics.get("disc/ranking_acc", 0)
             w_dist  = sr - 0.5 * sf - 0.5 * sh
+            e_anchor = metrics.get("loss/encoder_anchor", 0)
             fmax    = metrics.get("val/fmax_bp", None)
             fmax_str = f"  val_Fmax={fmax:.4f}" if fmax is not None else ""
             print(
                 f"[Adv Epoch {epoch}/{total}] "
                 f"W_dist={w_dist:.3f}  C_loss={crit:.3f}  G_loss={g:.3f}  "
                 f"scores(real={sr:.2f} fake={sf:.2f} hard={sh:.2f})  "
-                f"DistMult={dm:.3f}  acc(real={ra*100:.0f}% rank={rank_ac*100:.0f}%)"
+                f"DistMult={dm:.3f}  acc(real={ra*100:.0f}% rank={rank_ac*100:.0f}%)  "
+                f"E_anchor={e_anchor:.3f}"
                 f"  {fmax_str}"
             )
         else:
