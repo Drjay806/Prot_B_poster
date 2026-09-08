@@ -14,6 +14,7 @@ from src.models.distmult import DistMult
 from src.data.graph_builder import build_annotation_matrix
 from src.data.negative_sampler import NegativeSampler
 from src.utils.logger import TrainingLogger
+from src.utils.losses import ranking_loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -243,7 +244,21 @@ def train_adversarial(
             ep = p_emb_g[row[enc_perm]]    # [B, D]  -- true protein embeddings
             eg = go_emb_g[col[enc_perm]]   # [B, D]  -- their TRUE annotated GO embeddings
             adv_enc = -discriminator.score(ep, eg).mean()
-            dm_enc  = -distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg).mean()
+            # Margin-based ranking loss instead of raw score maximisation. Plain
+            # "-distmult(...).mean()" has no ceiling -- the encoder is always rewarded for
+            # inflating the score further, with no notion of "good enough". Observed directly
+            # in a full 100-epoch run: DistMult climbed almost linearly the entire time
+            # (0.754 -> 1.176, never plateauing) while real Fmax degraded from 0.4064 to
+            # 0.2622 over the same run -- the signature of an unbounded objective slowly
+            # distorting the embedding space long after it stopped helping. Phase 1's own
+            # ComplEx loss already avoids this via a margin hinge (pretrain.py); this mirrors
+            # that fix here. Once the true triple beats a random negative by >= margin, this
+            # term's gradient is exactly zero -- no more pressure to keep inflating scores.
+            neg_go_idx = torch.randint(0, n_go, (enc_sample,), device=device)
+            neg_g      = go_emb_g[neg_go_idx]
+            pos_dm = distmult(ep, rv_g.unsqueeze(0).expand_as(ep), eg)
+            neg_dm = distmult(ep, rv_g.unsqueeze(0).expand_as(ep), neg_g)
+            dm_enc = ranking_loss(pos_dm, neg_dm, margin=1.0)
             # Cosine anchor on the encoder's own update, mirroring the generator's anchor
             # loss above (line ~179). Without this, nothing in Phase 2 keeps the encoder's
             # TRUE (protein, GO) pairs close together in cosine space once epoch >= 20 --
