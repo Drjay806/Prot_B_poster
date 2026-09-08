@@ -31,6 +31,7 @@ def train_adversarial(
     cfg:           dict,
     device:        str = "cuda",
     logger:        Optional[TrainingLogger] = None,
+    checkpoint_dir: Optional[str] = None,
 ) -> Tuple[CompGCN, Generator, Discriminator]:
     """
     Phase 2: WGAN-GP adversarial training.
@@ -42,6 +43,17 @@ def train_adversarial(
         hard vocabulary negatives (low)
 
     No mixed-precision (autocast removed) — encoder produces float32 throughout.
+
+    Progress is monitored with _quick_fmax_complex() (ComplEx-scored, matching
+    evaluate_all's official metric) rather than the cosine-based _quick_fmax() --
+    this phase's own encoder update has no cosine term, so a cosine-based check can
+    decline for many epochs while the real, reported Fmax is actually improving.
+    If checkpoint_dir is given, the best checkpoint by this metric is saved to
+    <checkpoint_dir>/adversarial_best.pt as training progresses, not just once at
+    the end -- mirrors the pattern already used by Phase 3 (train_rl) and Phase 4
+    (train_calibration_head), which this phase previously lacked despite already
+    tracking a best_fmax variable that was never actually used to save anything.
+
     Returns updated (encoder, generator, discriminator/critic).
     """
     adv_cfg    = cfg["adversarial"]
@@ -255,12 +267,22 @@ def train_adversarial(
         avg = {k: sum(v) / max(len(v), 1) for k, v in epoch_metrics.items()}
 
         if epoch % eval_every == 0 or epoch == epochs:
-            val_fmax = _quick_fmax(encoder, generator, distmult, rel_idx, val_data, target_type, cfg, device)
+            val_fmax = _quick_fmax_complex(encoder, distmult, rel_idx, val_data, target_type, device)
             avg["val/fmax_bp"] = val_fmax
             if logger:
                 logger.log({"val/fmax_bp": val_fmax}, step=global_step, phase="adversarial")
             if val_fmax > best_fmax:
                 best_fmax = val_fmax
+                if checkpoint_dir:
+                    best_path = os.path.join(checkpoint_dir, "adversarial_best.pt")
+                    torch.save({
+                        "epoch":         epoch,
+                        "fmax":          val_fmax,
+                        "encoder":       encoder.state_dict(),
+                        "generator":     generator.state_dict(),
+                        "discriminator": discriminator.state_dict(),
+                    }, best_path)
+                    print(f"  New best (ComplEx-scored) Fmax={val_fmax:.4f} at epoch {epoch} -- saved {best_path}")
 
         if logger:
             logger.log_adv_epoch(epoch, epochs, avg)
@@ -387,4 +409,74 @@ def _quick_fmax(
             best_fmax = max(best_fmax, 2 * prec * rec / denom)
 
     encoder.train(); generator.train()
+    return best_fmax
+
+
+@torch.no_grad()
+def _quick_fmax_complex(
+    encoder:     CompGCN,
+    distmult:    DistMult,
+    rel_idx:     int,
+    val_data:    HeteroData,
+    target_type: str,
+    device:      str,
+    n_sample:    int = 5000,
+) -> float:
+    """
+    Fast approximate Fmax scored with ComplEx (via `distmult`), the SAME scoring
+    method evaluate_all()'s "official" numbers use -- unlike _quick_fmax() above,
+    which uses cosine similarity. Cosine is the right quick check for Phase 1 (it's
+    what pretrain optimises) and for Phase 3 (the encoder is frozen there, so cosine
+    alignment doesn't drift). It is NOT the right check for Phase 2's own encoder
+    update, which optimises critic-fooling + ComplEx compatibility with no cosine
+    term at all -- watching cosine there can decline for epochs while the actual,
+    reported Fmax is improving (observed directly this project: cosine-based
+    val_Fmax fell from 0.41 to 0.23 over 95 epochs while the real, ComplEx-scored
+    Fmax on the same checkpoint was 0.4544, above the Phase-1 baseline).
+
+    No hierarchy propagation, for speed -- this is a fast proxy for monitoring and
+    best-checkpoint selection during training, not a substitute for evaluate_all().
+    """
+    from src.data.graph_builder import build_annotation_matrix
+    encoder.eval()
+
+    protein_embs, go_embs, rel_embs = encoder(val_data)
+    rel_vec = rel_embs[rel_idx]
+
+    row, col, n_p, n_go = build_annotation_matrix(val_data, target_type)
+    row_cpu, col_cpu = row.cpu(), col.cpu()
+
+    unique_prots = row_cpu.unique()
+    if len(unique_prots) > n_sample:
+        perm = torch.randperm(len(unique_prots))[:n_sample]
+        unique_prots = unique_prots[perm]
+
+    prot_map = {p.item(): i for i, p in enumerate(unique_prots)}
+    mask  = torch.isin(row_cpu, unique_prots)
+    s_row = torch.tensor([prot_map[p.item()] for p in row_cpu[mask]], dtype=torch.long)
+    s_col = col_cpu[mask]
+
+    n_sample_actual = len(unique_prots)
+    true_mat = torch.zeros(n_sample_actual, n_go, dtype=torch.float32)
+    true_mat[s_row, s_col] = 1.0
+
+    sampled_embs = protein_embs[unique_prots.to(device)]
+    scores = distmult.score_all(sampled_embs.float(), rel_vec.float(), go_embs.float()).cpu()
+
+    best_fmax    = 0.0
+    true_pos_cnt = true_mat.sum(dim=1).clamp(min=1e-8)
+    score_min = scores.min().item()
+    score_max = scores.max().item()
+    for t in range(51):
+        thresh   = score_min + t * (score_max - score_min) / 50
+        pred     = (scores >= thresh).float()
+        tp       = (pred * true_mat).sum(dim=1)
+        pred_pos = pred.sum(dim=1).clamp(min=1e-8)
+        prec     = (tp / pred_pos).mean().item()
+        rec      = (tp / true_pos_cnt).mean().item()
+        denom    = prec + rec
+        if denom > 0:
+            best_fmax = max(best_fmax, 2 * prec * rec / denom)
+
+    encoder.train()
     return best_fmax
