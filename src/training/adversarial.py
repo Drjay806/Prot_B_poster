@@ -449,8 +449,15 @@ def _quick_fmax_complex(
     val_Fmax fell from 0.41 to 0.23 over 95 epochs while the real, ComplEx-scored
     Fmax on the same checkpoint was 0.4544, above the Phase-1 baseline).
 
-    No hierarchy propagation, for speed -- this is a fast proxy for monitoring and
-    best-checkpoint selection during training, not a substitute for evaluate_all().
+    Uses the same base-linear + extra-fine-top-10% threshold hybrid as evaluate_all()
+    (see metrics.py), so its Fmax numbers are now directly comparable to evaluate_all()'s
+    on the same checkpoint -- a flat evenly-spaced grid previously read ~0.14 lower here
+    for no reason other than threshold resolution, which was mistaken for real training
+    degradation earlier in this project (see the note above Cell 8L in the notebook).
+
+    Still samples only 5,000 proteins and skips hierarchy propagation, for speed -- this
+    is a fast proxy for monitoring and best-checkpoint selection during training, not a
+    full substitute for evaluate_all(), but the two should now track each other closely.
     """
     from src.data.graph_builder import build_annotation_matrix
     encoder.eval()
@@ -482,8 +489,20 @@ def _quick_fmax_complex(
     true_pos_cnt = true_mat.sum(dim=1).clamp(min=1e-8)
     score_min = scores.min().item()
     score_max = scores.max().item()
-    for t in range(51):
-        thresh   = score_min + t * (score_max - score_min) / 50
+
+    # Same base-linear + extra-fine-top-10% hybrid as evaluate_all() (see metrics.py) --
+    # a flat 51-point grid systematically underestimates Fmax for this problem's class
+    # imbalance, because the true optimum sits close to the top of the score range where
+    # a flat grid has the least resolution. Without this, this function's numbers are not
+    # comparable to evaluate_all()'s, even on the identical model (confirmed directly: a
+    # frozen-in-place encoder read 0.40 here and 0.54 via evaluate_all() in the same run).
+    t_steps = 50
+    base_thresholds = [score_min + i * (score_max - score_min) / t_steps for i in range(t_steps + 1)]
+    top_start = score_min + 0.9 * (score_max - score_min)
+    extra_thresholds = [top_start + i * (score_max - top_start) / t_steps for i in range(1, t_steps + 1)]
+    thresholds = sorted(set(base_thresholds + extra_thresholds))
+
+    for thresh in thresholds:
         pred     = (scores >= thresh).float()
         tp       = (pred * true_mat).sum(dim=1)
         pred_pos = pred.sum(dim=1).clamp(min=1e-8)
