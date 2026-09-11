@@ -33,6 +33,7 @@ def train_adversarial(
     device:        str = "cuda",
     logger:        Optional[TrainingLogger] = None,
     checkpoint_dir: Optional[str] = None,
+    freeze_encoder: bool = False,
 ) -> Tuple[CompGCN, Generator, Discriminator]:
     """
     Phase 2: WGAN-GP adversarial training.
@@ -55,6 +56,18 @@ def train_adversarial(
     (train_calibration_head), which this phase previously lacked despite already
     tracking a best_fmax variable that was never actually used to save anything.
 
+    freeze_encoder : bool
+        When True, the encoder is never updated -- no opt_enc is created, and the
+        end-of-epoch encoder-update block never runs, regardless of epoch. Verified
+        this project: a full 100-epoch run with the encoder update enabled showed a
+        real, sustained decline (real evaluate_all Fmax matched the Phase 1 baseline
+        of 0.5420 at the best-by-internal-metric checkpoint, epoch 5 -- i.e. before
+        the encoder update even started -- while later checkpoints, once the update
+        was active, trended down). freeze_encoder=True isolates whether the
+        Generator/Critic adversarial game itself (scored via mode="critic" or
+        "ensemble" in evaluate_all, not mode="encoder") adds anything on top of a
+        fixed, high-quality Phase 1 representation, without that confound.
+
     Returns updated (encoder, generator, discriminator/critic).
     """
     adv_cfg    = cfg["adversarial"]
@@ -71,10 +84,16 @@ def train_adversarial(
     target_type = cfg["data"]["target_type"]
 
     encoder.set_dropout("adversarial")
-    encoder.train(); generator.train(); discriminator.train()
+    if freeze_encoder:
+        encoder.eval()   # no training-mode dropout noise on a fixed representation
+    else:
+        encoder.train()
+    generator.train(); discriminator.train()
 
     # WGAN-GP requires Adam(β1=0, β2=0.9) — other betas destabilise Wasserstein
-    opt_enc  = torch.optim.Adam(encoder.parameters(),       lr=adv_cfg["lr_encoder"],     betas=(beta1, beta2))
+    opt_enc  = None if freeze_encoder else torch.optim.Adam(
+        encoder.parameters(), lr=adv_cfg["lr_encoder"], betas=(beta1, beta2)
+    )
     opt_gen  = torch.optim.Adam(generator.parameters(),     lr=adv_cfg["lr_generator"],   betas=(beta1, beta2))
     opt_crit = torch.optim.Adam(
         discriminator.parameters(),
@@ -119,11 +138,13 @@ def train_adversarial(
         ]}
 
         # Encoder forward ONCE per epoch for batch-level embeddings (no grad for speed).
-        # A separate grad-enabled forward at epoch end updates encoder weights via opt_enc.
+        # A separate grad-enabled forward at epoch end updates encoder weights via opt_enc
+        # (skipped entirely when freeze_encoder=True -- see the encoder-update block below).
         encoder.eval()
         with torch.no_grad():
             protein_embs, go_embs, rel_embs = encoder(train_data)
-        encoder.train()
+        if not freeze_encoder:
+            encoder.train()
         protein_embs = protein_embs.detach()
         go_embs      = go_embs.detach()
         rel_vec      = rel_embs[rel_idx].detach()
@@ -235,7 +256,7 @@ def train_adversarial(
         # Updating the encoder against an untrained critic adds pure noise and
         # causes catastrophic forgetting of Phase 1 representations.
         _ENC_WARMUP = 20   # epochs to let critic stabilise before touching encoder
-        if epoch >= _ENC_WARMUP:
+        if (not freeze_encoder) and epoch >= _ENC_WARMUP:
             opt_enc.zero_grad()
             p_emb_g, go_emb_g, r_emb_g = encoder(train_data)
             rv_g       = r_emb_g[rel_idx]
