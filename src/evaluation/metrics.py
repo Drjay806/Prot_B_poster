@@ -623,7 +623,16 @@ def _build_chunk_scores(
         ).cpu()   # [C, N_go]
         if gen_weight > 0 and gen_chunk is not None:
             gen_scores = (gen_chunk.to(device) @ g_norm.t()).cpu()
-            return (1.0 - gen_weight) * enc_scores + gen_weight * gen_scores
+            # Normalise to [0,1] before blending -- enc_scores (raw ComplEx, roughly
+            # [-7, 10] in this project) and gen_scores (cosine similarity, [-1, 1])
+            # are on very different scales. Blending them raw lets enc_scores
+            # numerically dominate for any gen_weight below ~0.9, making a sweep
+            # over gen_weight look almost flat regardless of whether the generator
+            # actually helps. Same fix already used in the "ensemble" branch below.
+            def _norm01(x):
+                mn, mx = x.min(), x.max()
+                return (x - mn) / (mx - mn + 1e-8)
+            return (1.0 - gen_weight) * _norm01(enc_scores) + gen_weight * _norm01(gen_scores)
         return enc_scores
 
     elif mode in ("critic", "calibration"):
