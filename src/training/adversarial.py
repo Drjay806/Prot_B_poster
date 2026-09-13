@@ -34,6 +34,7 @@ def train_adversarial(
     logger:        Optional[TrainingLogger] = None,
     checkpoint_dir: Optional[str] = None,
     freeze_encoder: bool = False,
+    gen_loss_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[CompGCN, Generator, Discriminator]:
     """
     Phase 2: WGAN-GP adversarial training.
@@ -68,11 +69,26 @@ def train_adversarial(
         "ensemble" in evaluate_all, not mode="encoder") adds anything on top of a
         fixed, high-quality Phase 1 representation, without that confound.
 
+    gen_loss_weights : dict or None
+        Overrides the Generator's loss mix, {"adv": .., "dm": .., "anchor": ..}
+        (default {"adv": 0.7, "dm": 0.5, "anchor": 0.2} -- the original design,
+        which deliberately keeps "anchor" small so the Generator stays a useful,
+        diverse hard-negative source for the Critic rather than collapsing onto
+        the true answer; see the comment at the loss_gen assignment below).
+        Pass e.g. {"adv": 0.1, "dm": 0.1, "anchor": 1.0} to instead train the
+        Generator AS a completion mechanism -- reconstruction-dominant, with the
+        adversarial term reduced to a light realism regularizer (the pix2pix
+        pattern). Untested in this project prior to this parameter's addition;
+        evaluate the result via evaluate_all(mode="encoder", generator=...,
+        cfg=<cfg with evaluation.gen_weight > 0>), which blends the Generator's
+        own cosine-similarity-based nearest-match score into the ranking.
+
     Returns updated (encoder, generator, discriminator/critic).
     """
     adv_cfg    = cfg["adversarial"]
     epochs     = adv_cfg["epochs"]
     batch_size = adv_cfg["batch_size"]
+    glw        = gen_loss_weights or {"adv": 0.7, "dm": 0.5, "anchor": 0.2}
     n_critic   = adv_cfg.get("n_critic", 1)
     grad_clip  = adv_cfg.get("grad_clip", 1.0)
     eval_every = adv_cfg.get("eval_every", 5)
@@ -212,11 +228,14 @@ def train_adversarial(
             #    convincing," which forces the critic to learn biological compatibility.
             anchor_loss = (1.0 - F.cosine_similarity(fake_g, pos_g)).mean()
 
-            # Weights: adv dominates so the generator explores GO space and gives
-            # the critic real diversity to learn from. Anchor at 0.2 is a light
-            # semantic tether — prevents unconstrained drift without collapsing
-            # fake → true GO (which kills the critic's training signal).
-            loss_gen = 0.7 * adv_loss + 0.5 * dm_loss + 0.2 * anchor_loss
+            # Weights: default has adv dominate so the generator explores GO space
+            # and gives the critic real diversity to learn from -- anchor at 0.2 is
+            # a light semantic tether, deliberately not enough to collapse fake ->
+            # true GO (which would kill the critic's training signal). Pass
+            # gen_loss_weights with a large "anchor" weight instead to train the
+            # Generator AS a completion mechanism (reconstruction-dominant) -- see
+            # the gen_loss_weights docstring above.
+            loss_gen = glw["adv"] * adv_loss + glw["dm"] * dm_loss + glw["anchor"] * anchor_loss
 
             loss_gen.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
