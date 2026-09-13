@@ -217,9 +217,19 @@ def train_adversarial(
             # 1. Fool the critic (Wasserstein adversarial signal)
             adv_loss = -discriminator.score(pos_p, fake_g).mean()
 
-            # 2. Structural plausibility via DistMult
+            # 2. Structural plausibility via DistMult -- margin-based, not raw
+            # maximisation. Plain "-dm_scores.mean()" has no ceiling: the generator
+            # is always rewarded for inflating the score further, the same unbounded
+            # pattern that was found to distort the ENCODER's embedding space over a
+            # full 100-epoch run elsewhere in this file (see the encoder-update block
+            # below). Low-risk with anchor_loss dominant and only a handful of
+            # epochs, but fixed now rather than left as a landmine for whoever raises
+            # dm's weight or epoch count later -- costs nothing today.
             dm_scores = distmult(pos_p, rel_vec.unsqueeze(0).expand_as(pos_p), fake_g)
-            dm_loss   = -dm_scores.mean()
+            neg_go_idx_gen = torch.randint(0, n_go, (len(b_prot_idx),), device=device)
+            neg_g_gen      = go_embs[neg_go_idx_gen]
+            neg_dm_scores  = distmult(pos_p, rel_vec.unsqueeze(0).expand_as(pos_p), neg_g_gen)
+            dm_loss        = ranking_loss(dm_scores, neg_dm_scores, margin=1.0)
 
             # 3. Cosine anchor: pull generator toward the TRUE GO embedding neighborhood.
             #    Without this, the generator has zero incentive to produce biologically
