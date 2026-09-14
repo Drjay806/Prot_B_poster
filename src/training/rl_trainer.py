@@ -205,6 +205,189 @@ def train_rl(
     return encoder, generator
 
 
+def train_rl_reinforce(
+    encoder: CompGCN,
+    generator: Generator,
+    distmult: DistMult,
+    reward_module: RewardModule,
+    train_data: HeteroData,
+    val_data: HeteroData,
+    ancestor_table: Dict[int, FrozenSet[int]],
+    cfg: dict,
+    device: str = "cuda",
+    checkpoint_dir: Optional[str] = None,
+    logger: Optional[TrainingLogger] = None,
+) -> Tuple[CompGCN, Generator]:
+    """
+    Phase 3 (RL variant): genuine policy-gradient (REINFORCE) refinement of the
+    Generator, using RewardModule's full composite reward.
+
+    WHY THIS EXISTS SEPARATELY FROM train_rl():
+        train_rl() is a best-of-k *differentiable* refinement -- it samples k
+        candidates, picks the one closest to the true GO embedding, and
+        backpropagates a direct cosine/ancestor-similarity loss through it.
+        That works, but it never calls RewardModule at all, despite this
+        project defining one specifically for RL. The reason it was never
+        wired in naively (e.g. loss = -reward_module.compute(...).mean()) is
+        that RewardModule.compute() wraps its adversarial term (r_adv, the
+        Critic's judgment) and its hierarchy penalty (p_hier) in
+        @torch.no_grad() -- direct backprop through that reward would give
+        those two terms EXACTLY ZERO gradient. They'd be logged but would
+        never actually influence training. Only the structural (r_struct) and
+        semantic (r_sem) terms would get a gradient, identical in spirit to
+        train_rl()'s own direct losses -- i.e. calling reward_module.compute()
+        and backpropagating through it directly would not be new information,
+        it would just be a more roundabout way to do what train_rl() already
+        does, while silently dropping the Critic's actual contribution.
+
+    HOW THIS FIXES IT:
+        We treat the Generator's deterministic output as the MEAN of a
+        Gaussian policy over the 256-dim GO-embedding action space:
+            a ~ N(mu_theta(p, r), sigma^2 I),   mu_theta = generator.deterministic(p, r)
+        and update via the policy-gradient theorem:
+            grad_theta J = E[ (R(a) - b) * grad_theta log pi_theta(a | p, r) ]
+        where b is a batch-mean baseline (variance reduction only -- does not
+        bias the gradient). This is what correctly credits gradient to EVERY
+        reward term, including the two that direct backprop would silently
+        ignore -- the reward is used only as a scalar weight on the
+        log-probability of the sampled action, so it never needs to be
+        differentiable itself.
+
+    RISK NOTED, ACCEPTED DELIBERATELY: policy gradient has higher variance
+    than direct backprop and can be less sample-efficient. The reward terms
+    reused here (DistMult, the trained Critic, direct cosine similarity to
+    ground truth) are all already-validated scoring functions used elsewhere
+    in this pipeline -- not a newly-invented fast Fmax proxy -- which avoids
+    the specific proxy-metric-mismatch failure mode found twice earlier in
+    this project (Phase 2's internal monitoring metric).
+    """
+    rl_cfg     = cfg["rl"]
+    epochs     = rl_cfg["epochs"]
+    batch_size = rl_cfg["batch_size"]
+    lr_gen     = rl_cfg["lr_generator"]
+    grad_clip  = rl_cfg.get("grad_clip", 1.0)
+    eval_every = rl_cfg.get("eval_every", 3)
+    log_every  = rl_cfg.get("log_every_steps", 10)
+    sigma      = rl_cfg.get("policy_sigma", 0.1)   # std of the Gaussian policy
+
+    target_type = cfg["data"]["target_type"]
+
+    generator.train()
+    encoder.eval()
+    opt_gen = torch.optim.Adam(generator.parameters(), lr=lr_gen)
+
+    row, col, n_p, n_go = build_annotation_matrix(train_data, target_type)
+    row, col = row.to(device), col.to(device)
+    rel_idx = _get_has_function_rel_idx(encoder)
+
+    with torch.no_grad():
+        protein_embs, go_embs, rel_embs = encoder(train_data)
+    protein_embs = protein_embs.detach()
+    go_embs      = go_embs.detach()
+    rel_vec      = rel_embs[rel_idx].detach()
+
+    print(f"Starting RL (REINFORCE) training: {epochs} epochs, policy_sigma={sigma}")
+    print(f"  Reward = w1*structural + w2*adversarial + w3(t)*semantic - lambda*hierarchy_penalty")
+
+    best_fmax   = 0.0
+    global_step = 0
+
+    for epoch in range(1, epochs + 1):
+        reward_module.set_epoch(epoch)
+        perm = torch.randperm(len(row), device=device)
+        row_s, col_s = row[perm], col[perm]
+
+        epoch_reward: List[float] = []
+        epoch_gnorm:  List[float] = []
+        epoch_parts: Dict[str, list] = {
+            "reward/structural": [], "reward/adversarial": [],
+            "reward/semantic": [], "reward/hierarchy_penalty": [],
+        }
+
+        for start in range(0, len(row_s), batch_size):
+            end = min(start + batch_size, len(row_s))
+            b_prot_idx = row_s[start:end]
+            b_go_idx   = col_s[start:end]
+            B = end - start
+
+            pos_p  = protein_embs[b_prot_idx]   # [B, D]
+            true_g = go_embs[b_go_idx]          # [B, D]
+
+            opt_gen.zero_grad()
+
+            # Policy mean: deterministic generator output (no noise input)
+            mu = generator.deterministic(pos_p, rel_vec)   # [B, D], requires_grad via generator params
+
+            # Sample the action from the Gaussian policy, then renormalise onto the
+            # unit sphere (consistent with every other embedding in this pipeline --
+            # Generator's own forward() always L2-normalises its output). The action
+            # is fully detached: REINFORCE credits gradient via log pi(a|mu), not by
+            # backpropagating through the sampled action itself.
+            with torch.no_grad():
+                eps    = torch.randn_like(mu)
+                action = F.normalize(mu + sigma * eps, dim=-1)
+
+                predicted_go_idxs = (action @ go_embs.t()).argmax(dim=-1)
+                reward, reward_parts = reward_module.compute(
+                    protein_emb=pos_p, relation_emb=rel_vec, fake_go_emb=action,
+                    true_go_emb=true_g, all_go_embs=go_embs,
+                    predicted_go_idxs=predicted_go_idxs, ancestor_table=ancestor_table,
+                )
+
+            # Batch-mean baseline for variance reduction -- does not bias the gradient,
+            # only reduces its variance (standard REINFORCE practice).
+            baseline  = reward.mean()
+            advantage = (reward - baseline).detach()
+
+            # Gaussian log-probability of the sampled action under N(mu, sigma^2 I).
+            # Constant normalisation terms (independent of mu) are dropped -- they
+            # don't affect the gradient.
+            log_prob = -0.5 * ((action - mu) ** 2).sum(dim=-1) / (sigma ** 2)
+
+            loss = -(advantage * log_prob).mean()
+
+            loss.backward()
+            gnorm = torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip)
+            opt_gen.step()
+
+            global_step += 1
+            epoch_reward.append(reward.mean().item())
+            epoch_gnorm.append(gnorm if isinstance(gnorm, float) else gnorm.item())
+            for k, v in reward_parts.items():
+                if k in epoch_parts:
+                    epoch_parts[k].append(v)
+
+            if logger and global_step % log_every == 0:
+                logger.log({"reward/total_mean": reward.mean().item(), **reward_parts},
+                           step=global_step, phase="rl_reinforce")
+
+        avg_reward = sum(epoch_reward) / max(len(epoch_reward), 1)
+        avg_gnorm  = sum(epoch_gnorm) / max(len(epoch_gnorm), 1)
+        avg_parts  = {k: (sum(v) / max(len(v), 1)) for k, v in epoch_parts.items()}
+
+        is_best = False
+        fmax_str = ""
+        if epoch % eval_every == 0 or epoch == epochs:
+            val_fmax = _quick_fmax(encoder, generator, distmult, rel_idx, val_data, target_type, cfg, device)
+            fmax_str = f"  val_Fmax={val_fmax:.4f}"
+            if val_fmax > best_fmax:
+                best_fmax = val_fmax
+                is_best   = True
+                if checkpoint_dir:
+                    _save_checkpoint(encoder, generator, epoch, val_fmax, checkpoint_dir)
+
+        best_str = " *** NEW BEST" if is_best else ""
+        print(
+            f"[RL-REINFORCE Epoch {epoch}/{epochs}] reward={avg_reward:.4f} "
+            f"(struct={avg_parts['reward/structural']:.3f} adv={avg_parts['reward/adversarial']:.3f} "
+            f"sem={avg_parts['reward/semantic']:.3f} hier_pen={avg_parts['reward/hierarchy_penalty']:.3f}) "
+            f"grad_norm={avg_gnorm:.3f}{fmax_str}{best_str}"
+        )
+
+    print(f"RL (REINFORCE) training complete. Best val Fmax: {best_fmax:.4f}")
+    return encoder, generator
+
+
 def _ancestor_sim_loss(
     fake_g: torch.Tensor,
     b_go_idx: torch.Tensor,
