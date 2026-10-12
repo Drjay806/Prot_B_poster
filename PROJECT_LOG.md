@@ -410,6 +410,67 @@ Explicit instruction carried through the project: **"we shouldn't say ours is be
 
 ---
 
+## 11. Metrics Glossary
+
+**Honesty note**: an earlier version of this project is described (in a prior conversation summary) as having produced a plain-language metrics glossary with original-paper citations. That content could not be located verbatim in either session transcript after a direct search — it may have existed only in a part of a conversation that was summarized without being preserved. Rather than guess at what it said, this is a **freshly written replacement**, built to match exactly what this repo's own code computes (`src/evaluation/metrics.py`, `src/evaluation/smin.py`).
+
+### Fmax
+The main headline metric throughout this project. At every possible decision threshold `t`, compute precision and recall per-protein, average them across all proteins, combine into an F1 score, then take the **best F1 across all thresholds**:
+
+$$F_{\max} = \max_{t} \left\{ \frac{2 \cdot pr(t) \cdot rc(t)}{pr(t) + rc(t)} \right\}$$
+
+**Plain language**: imagine sliding a "how confident do I need to be before I'll call this a real prediction" dial from 0 to 1, checking precision/recall at every setting, and reporting your best score. This is why a poorly-calibrated model (like ProtHGT scored against the full candidate space, Section 5.4) can still get a *reasonable* Fmax if there's *some* threshold where it does okay — but collapses hard if its scores are bunched at the extremes with no usable middle ground.
+**Origin**: introduced for CAFA (Critical Assessment of Function Annotation) in Radivojac et al. 2013, *"A large-scale evaluation of computational protein function prediction,"* Nature Methods.
+
+### Smin
+A semantic-distance metric using the Gene Ontology's structure and each term's **information content** (how specific/rare a term is — "metabolic process" is less informative than "regulation of mitochondrial fission during apoptosis"). It penalizes a wrong prediction more if it's a confusing, semantically-distant guess than if it's a near-miss in the GO hierarchy.
+
+$$S_{\min} = \min_t \sqrt{ru(t)^2 + mi(t)^2}$$
+
+where `ru` = remaining uncertainty (true terms missed, weighted by information content) and `mi` = misinformation (wrong terms predicted, weighted by information content).
+**Plain language**: Fmax treats every GO term as equally important; Smin instead penalizes you more for missing or wrongly predicting a *specific, informative* term than a vague, common one. **Lower is better** (unlike every other metric here) — it's an error measure, not a score.
+**Origin**: Clark & Radivojac 2013, *"Information-theoretic evaluation of predicted ontological annotations,"* Bioinformatics (ISMB proceedings).
+
+### MCC (Matthews Correlation Coefficient)
+A single number from -1 (total disagreement) to +1 (perfect prediction), 0 = random, computed from the confusion matrix (true/false positives/negatives) **at one fixed threshold** — unlike Fmax, which gets to pick its best threshold.
+
+$$MCC = \frac{TP \cdot TN - FP \cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}$$
+
+**Plain language**: this is why ProtHGT's MCC (0.1949) looks so much worse relative to its AUROC (0.80) than you'd expect — MCC is computed at ONE threshold and punishes a model that hasn't found a sensible operating point, exactly the calibration problem diagnosed in Section 5.4.
+**Origin**: Matthews 1975, *"Comparison of the predicted and observed secondary structure of T4 phage lysozyme,"* Biochimica et Biophysica Acta.
+
+### Micro-F1 vs. Macro-F1
+Both are F1 (precision/recall harmonic mean) at a fixed threshold, but averaged differently:
+- **Micro-F1**: pool every (protein, GO-term) prediction across the whole test set into one giant confusion matrix, then compute F1 once. Dominated by common terms (they have more examples).
+- **Macro-F1**: compute F1 separately for *each* GO term, then average those scores equally across all ~27,855 terms — a term with 3 examples counts exactly as much as one with 30,000.
+**Plain language**: ProtHGT's Macro-F1 of 0.0031 (essentially zero) versus a less-catastrophic Micro-F1 of 0.1961 tells you it's failing on almost *every individual term*, especially rare ones, while doing comparatively less badly on the handful of very common terms that dominate the micro-averaged pool.
+
+### AUROC (Area Under the ROC Curve)
+Plots true-positive rate vs. false-positive rate across every threshold, then takes the area underneath. 0.5 = random guessing, 1.0 = perfect ranking. **Only cares about relative ranking of scores, not their absolute calibration** — this is precisely why ProtHGT can score a respectable 0.80 here while collapsing on Fmax/MCC (Section 5.4): it's still putting true pairs above false ones most of the time, it just hasn't found a sensible absolute cutoff.
+
+### AUPR (Area Under the Precision-Recall Curve)
+Like AUROC, but plots precision vs. recall instead. More sensitive than AUROC when the true positives are a tiny fraction of all possible pairs (true here: out of ~27,855 candidate GO terms per protein, only a handful are actually correct) — this is why AUPR dropped much further than AUROC for ProtHGT (0.0858 vs. 0.8007): AUPR reacts much more harshly to a flood of false positives than AUROC does.
+
+### Hit@k and MRR (Mean Reciprocal Rank)
+Borrowed from knowledge-graph-completion literature (not originally a protein-function metric): for each true (protein, GO-term) pair, rank all candidate terms by score and ask "was the true term in the top k?" (**Hit@k**, e.g. Hit@1/3/10) or "what's 1/rank of the true term, averaged across all test pairs?" (**MRR** — a true term at rank 1 contributes 1.0, at rank 10 contributes 0.1, etc.).
+**Plain language**: these answer "if I handed you the model's top-k guesses, how often would the real answer be in there?" — a more forgiving, ranking-based view than Fmax's pick-one-threshold-and-grade-everything approach. **Origin** (commonly cited source for this evaluation style): Bordes et al. 2013, *"Translating Embeddings for Modeling Multi-relational Data,"* NeurIPS (the TransE paper).
+
+### Quick reference table
+
+| Metric | Range | Higher/lower better | Threshold-dependent? | What it's most sensitive to |
+|---|---|---|---|---|
+| Fmax | 0–1 | Higher | No (picks best) | Overall precision/recall balance |
+| Smin | 0–∞ | **Lower** | No (picks best) | Semantic severity of errors |
+| MCC | -1–1 | Higher | Yes (fixed) | Calibration at one operating point |
+| Micro-F1 | 0–1 | Higher | Yes (fixed) | Performance on common terms |
+| Macro-F1 | 0–1 | Higher | Yes (fixed) | Performance on rare terms |
+| AUROC | 0–1 | Higher | No (integrates over all) | Relative ranking quality |
+| AUPR | 0–1 | Higher | No (integrates over all) | Ranking quality under class imbalance |
+| Hit@k | 0–1 | Higher | No (top-k) | "Is the answer in my shortlist?" |
+| MRR | 0–1 | Higher | No (rank-based) | Average rank of the true answer |
+
+---
+
 ## Appendix A — Full Commit Log
 
 See `git log --all --date=short --pretty=format:"%ad | %h | %s"` for the authoritative, current list. Spans `75ff58c` (2026-06-05) through `0494c4f` (2026-10-05), ~100 commits.
